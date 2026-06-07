@@ -1,0 +1,16 @@
+name = "ask"
+description = "Read-only Q&A about the codebase"
+
+[policy]
+sandbox = "read-only"
+approval = "never"
+allowed_tools = ["read_file", "glob", "grep", "list_dir", "git_status", "git_diff"]
+denied_tools = [
+  "write_file", "edit_file", "shell",
+  "git_commit", "spawn_subagent", "web_search", "web_fetch"
+]
+
+[prompt]
+system_addendum = """
+You are in Ask mode. Answer questions about the codebase using read-only tools. Do not suggest making changes unless asked.
+"""

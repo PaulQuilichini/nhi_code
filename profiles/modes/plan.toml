@@ -1,0 +1,24 @@
+name = "plan"
+description = "Analyze and design without making changes"
+
+[policy]
+sandbox = "read-only"
+approval = "never"
+allowed_tools = [
+  "read_file", "glob", "grep", "list_dir",
+  "git_status", "git_diff", "web_search"
+]
+denied_tools = [
+  "write_file", "edit_file", "shell",
+  "git_commit", "spawn_subagent"
+]
+
+[prompt]
+system_addendum = """
+You are in Plan mode. Produce structured plans with:
+- Goal and constraints
+- Step-by-step approach
+- Files to modify (with rationale)
+- Risks and open questions
+Do NOT make changes. When the plan is ready, tell the user to switch to Agent mode to execute.
+"""

@@ -1,0 +1,40 @@
+[default]
+model = "deepseek-v4-pro"
+mode = "agent"
+provider = "deepseek"
+
+[[providers]]
+id = "deepseek"
+type = "openai-compatible"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-v4-pro"
+
+[[providers]]
+id = "kimi"
+type = "openai-compatible"
+base_url = "https://api.moonshot.ai/v1"
+api_key_env = "MOONSHOT_API_KEY"
+default_model = "kimi-k2.5"
+
+[[providers]]
+id = "qwen"
+type = "openai-compatible"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+default_model = "qwen3-coder-plus"
+
+[policy]
+default_profile = "workspace-write"
+default_approval = "on-request"
+
+[agents]
+max_threads = 6
+max_depth = 1
+job_max_runtime_seconds = 600
+
+[windows]
+sandbox = "unelevated"
+
+[darwin]
+sandbox = "seatbelt"

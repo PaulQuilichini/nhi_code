@@ -1,0 +1,45 @@
+{
+  "name": "@nhicode/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "predev": "pnpm build:server",
+    "dev:web": "concurrently \"tsx watch server/index.ts\" \"vite\"",
+    "build:web": "vite build",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=bundle --outfile=dist-server/bundle.cjs --banner:js=\"#!/usr/bin/env node\"",
+    "build": "pnpm build:web && pnpm build:server && tauri build",
+    "start": "node dist-server/bundle.cjs",
+    "tauri": "tauri",
+    "icons": "tauri icon app-icon.svg",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "@nhicode/core": "workspace:*",
+    "@nhicode/shared": "workspace:*",
+    "@tauri-apps/api": "^2.4.0",
+    "@tauri-apps/plugin-shell": "^2.2.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.4.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@types/ws": "^8.5.14",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.1"
+  }
+}

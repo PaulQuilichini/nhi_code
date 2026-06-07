@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.turbo/
+*.log
+.env
+.env.local
+.DS_Store
+Thumbs.db
+*.db
+*.db-journal
+apps/desktop/.vite/
+apps/desktop/dist/
+apps/desktop/dist-server/
+apps/desktop/src-tauri/target/

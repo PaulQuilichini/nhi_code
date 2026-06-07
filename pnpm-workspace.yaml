@@ -1,0 +1,7 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+
+# Required for Vite (pnpm v10+ blocks postinstall scripts by default)
+allowBuilds:
+  esbuild: true

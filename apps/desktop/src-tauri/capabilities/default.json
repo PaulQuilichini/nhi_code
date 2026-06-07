@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for NHI Code",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-set-title",
+    "core:window:allow-center",
+    "shell:allow-open"
+  ]
+}
