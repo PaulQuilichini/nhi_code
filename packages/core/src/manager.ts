@@ -1,15 +1,17 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { OpenAICompatibleProvider } from "@nhicode/models";
 import { createProvidersFromConfig } from "@nhicode/models";
 import { PolicyEngine } from "@nhicode/policy";
 import { ToolRegistry } from "@nhicode/tools";
-import { ContextBuilder, AGENT_PROFILES } from "@nhicode/context";
+import { ContextBuilder, AGENT_PROFILES, sanitizeMessageHistory } from "@nhicode/context";
 import { loadConfig, resolveApiKey } from "@nhicode/shared";
 import type {
   ApprovalResponse,
+  Message,
+  Project,
   SessionConfig,
   SessionEvent,
   SubAgentConfig,
@@ -19,14 +21,18 @@ import type {
 } from "@nhicode/shared";
 import { Session } from "./session.js";
 import { JsonStore } from "./store.js";
+import { ApiKeyStore } from "./keys.js";
+import type { StoredMessage } from "./store.js";
 
 export interface SessionManagerOptions {
   dataDir?: string;
   apiKeys?: Record<string, string>;
+  defaultProjectPath?: string;
 }
 
 export class SessionManager {
   private store: JsonStore;
+  private keyStore: ApiKeyStore;
   private sessions = new Map<string, Session>();
   private providers = new Map<string, OpenAICompatibleProvider>();
   private config: NhiCodeConfig;
@@ -36,13 +42,18 @@ export class SessionManager {
   constructor(options: SessionManagerOptions = {}) {
     const dataDir = options.dataDir ?? resolveDataDir();
     mkdirSync(dataDir, { recursive: true });
-    this.store = new JsonStore(dataDir);
-    this.apiKeys = options.apiKeys ?? {};
+    this.store = new JsonStore(dataDir, options.defaultProjectPath);
+    this.keyStore = new ApiKeyStore(dataDir);
+    this.apiKeys = { ...this.keyStore.getAll(), ...options.apiKeys };
     this.config = { default: {}, providers: [] };
   }
 
   async initialize(cwd?: string): Promise<void> {
     this.config = await loadConfig(cwd);
+    this.rebuildProviders();
+  }
+
+  private rebuildProviders(): void {
     this.providers = createProvidersFromConfig(
       this.config.providers
         .map((p) => {
@@ -71,6 +82,8 @@ export class SessionManager {
 
   setApiKey(providerId: string, key: string): void {
     this.apiKeys[providerId] = key;
+    this.keyStore.set(providerId, key);
+    this.rebuildProviders();
   }
 
   getConfig(): NhiCodeConfig {
@@ -81,18 +94,78 @@ export class SessionManager {
     return Array.from(this.providers.keys());
   }
 
-  listThreads(): ThreadSummary[] {
-    return this.store.listThreads();
+  listProjects(): Project[] {
+    return this.store.listProjects();
+  }
+
+  createProject(input: { name?: string; path: string }): Project {
+    return this.store.createProject(input);
+  }
+
+  updateProject(id: string, patch: { name?: string; path?: string }): Project {
+    const updated = this.store.updateProject(id, patch);
+    if (!updated) throw new Error(`Project '${id}' not found`);
+    return updated;
+  }
+
+  deleteProject(id: string): void {
+    if (!this.store.deleteProject(id)) {
+      throw new Error(`Project '${id}' not found`);
+    }
+  }
+
+  getThread(id: string): ThreadSummary | undefined {
+    return this.store.getThread(id);
+  }
+
+  listThreads(projectId?: string): ThreadSummary[] {
+    return this.store.listThreads(projectId);
+  }
+
+  getThreadMessages(threadId: string): StoredMessage[] {
+    return this.store.getThreadMessages(threadId);
+  }
+
+  ensureSession(id: string): Session | undefined {
+    const existing = this.sessions.get(id);
+    if (existing) return existing;
+
+    const thread = this.store.getThread(id);
+    if (!thread) return undefined;
+
+    return this.hydrateSession(thread);
   }
 
   createThread(options: {
-    cwd: string;
+    cwd?: string;
+    projectId?: string;
     mode?: string;
     model?: string;
     providerId?: string;
     parentId?: string;
     agentProfile?: string;
   }): Session {
+    let cwd = options.cwd;
+    let projectId = options.projectId;
+
+    if (options.parentId) {
+      if (!cwd) {
+        const parentSession = this.sessions.get(options.parentId);
+        if (parentSession) cwd = parentSession.cwd;
+      }
+      if (!projectId) {
+        const parentThread = this.store.getThread(options.parentId);
+        projectId = parentThread?.projectId;
+      }
+    } else if (projectId) {
+      const project = this.store.getProject(projectId);
+      if (!project) throw new Error(`Project '${projectId}' not found`);
+      cwd = project.path;
+    }
+
+    if (!cwd) {
+      throw new Error("Project is required to create a thread");
+    }
     const providerId =
       options.providerId ?? this.config.default?.provider ?? this.config.providers[0]?.id ?? "deepseek";
     const provider = this.providers.get(providerId);
@@ -109,7 +182,7 @@ export class SessionManager {
 
     const config: SessionConfig = {
       id: randomUUID(),
-      cwd: options.cwd,
+      cwd,
       mode,
       model,
       providerId,
@@ -152,12 +225,17 @@ export class SessionManager {
     );
 
     const now = new Date().toISOString();
+    const profileLabel = options.agentProfile
+      ? options.agentProfile.charAt(0).toUpperCase() + options.agentProfile.slice(1)
+      : null;
     this.store.upsertThread({
       id: config.id!,
-      title: "New thread",
-      cwd: options.cwd,
+      title: profileLabel ? `Sub-agent · ${profileLabel}` : "New thread",
+      cwd,
+      projectId: options.parentId ? undefined : projectId,
       mode,
       model,
+      providerId,
       status: "idle",
       parentId: options.parentId,
       createdAt: now,
@@ -179,9 +257,11 @@ export class SessionManager {
     const parent = this.sessions.get(parentId);
     if (!parent) throw new Error("Parent session not found");
 
+    const parentThread = this.store.getThread(parentId);
     const profile = AGENT_PROFILES[subConfig.profile];
     return this.createThread({
       cwd: parent.cwd,
+      projectId: parentThread?.projectId,
       mode: profile?.mode ?? "agent",
       model: subConfig.model ?? (subConfig.inheritModel !== false ? model : undefined),
       providerId,
@@ -191,11 +271,64 @@ export class SessionManager {
   }
 
   getSession(id: string): Session | undefined {
-    return this.sessions.get(id);
+    return this.ensureSession(id);
+  }
+
+  private hydrateSession(thread: ThreadSummary): Session {
+    const providerId =
+      thread.providerId ??
+      this.config.default?.provider ??
+      this.config.providers[0]?.id ??
+      "deepseek";
+    const provider = this.providers.get(providerId);
+    if (!provider) {
+      throw new Error(`Provider '${providerId}' not configured. Set API key in Settings.`);
+    }
+
+    const policy = new PolicyEngine(thread.mode);
+    const context = new ContextBuilder();
+    const maxTurns = 30;
+    const maxDepth = this.config.agents?.max_depth ?? 1;
+
+    const config: SessionConfig = {
+      id: thread.id,
+      cwd: thread.cwd,
+      mode: thread.mode,
+      model: thread.model,
+      providerId,
+      parentId: thread.parentId,
+    };
+
+    const session = new Session(
+      config,
+      provider,
+      policy,
+      this.tools,
+      context,
+      {
+        maxTurns,
+        maxDepth,
+        onSpawnSubAgent: (parentId, subConfig) =>
+          Promise.resolve(this.createSubAgent(parentId, subConfig, providerId, thread.model)),
+      },
+      thread.parentId ? 1 : 0,
+    );
+
+    const stored = this.store.getThreadMessages(thread.id);
+    if (stored.length > 0) {
+      session.restoreHistory(
+        sanitizeMessageHistory(stored.map(storedMessageToHistory)),
+        thread.title !== "New thread" ? thread.title : undefined,
+      );
+    }
+
+    session.on((event) => this.handleSessionEvent(thread.id, event));
+    this.sessions.set(thread.id, session);
+    return session;
   }
 
   respondToApproval(sessionId: string, response: ApprovalResponse): void {
-    this.sessions.get(sessionId)?.respondToApproval(response);
+    this.ensureSession(sessionId)?.respondToApproval(response);
   }
 
   private handleSessionEvent(threadId: string, event: SessionEvent): void {
@@ -211,20 +344,23 @@ export class SessionManager {
 
     if (event.type === "turn_complete") {
       const session = this.sessions.get(threadId);
-      if (session) {
+      const thread = this.store.getThread(threadId);
+      if (session && !thread?.parentId) {
         const history = session.getHistory();
-        const lastMessages = history.slice(-10);
-        for (const msg of lastMessages) {
-          this.store.addMessage({
+        const now = new Date().toISOString();
+        this.store.setThreadMessages(
+          threadId,
+          history.map((msg) => ({
             threadId,
             role: msg.role,
             content: msg.content,
+            reasoningContent: msg.reasoning_content,
             toolCalls: msg.tool_calls ? JSON.stringify(msg.tool_calls) : undefined,
             toolCallId: msg.tool_call_id,
             name: msg.name,
             createdAt: now,
-          });
-        }
+          })),
+        );
         this.store.updateThread(threadId, {
           title: session.getTitle(),
           updatedAt: now,
@@ -234,21 +370,34 @@ export class SessionManager {
   }
 
   subscribe(sessionId: string, listener: (event: SessionEvent) => void): Unsubscribe {
-    const session = this.sessions.get(sessionId);
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      const thread = this.store.getThread(sessionId);
+      if (thread) {
+        try {
+          session = this.hydrateSession(thread);
+        } catch {
+          return () => {};
+        }
+      }
+    }
     if (!session) return () => {};
     return session.on(listener);
   }
 }
 
+function storedMessageToHistory(msg: StoredMessage): Message {
+  return {
+    role: msg.role as Message["role"],
+    content: msg.content,
+    reasoning_content: msg.reasoningContent,
+    tool_calls: msg.toolCalls ? JSON.parse(msg.toolCalls) : undefined,
+    tool_call_id: msg.toolCallId,
+    name: msg.name,
+  };
+}
+
 function resolveDataDir(): string {
   const home = homedir();
-  const primary = join(home, ".nhicode", "data");
-  const legacy = [
-    join(home, ".suprmodl", "data"),
-    join(home, ".supermodel", "data"),
-  ];
-  for (const dir of [primary, ...legacy]) {
-    if (existsSync(dir)) return dir;
-  }
-  return primary;
+  return join(home, ".nhicode", "data");
 }

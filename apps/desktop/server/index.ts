@@ -5,7 +5,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { SessionManager } from "@nhicode/core";
-import type { ApprovalResponse, SessionEvent } from "@nhicode/shared";
+import type { ApprovalResponse } from "@nhicode/shared";
 
 const PORT = 3847;
 
@@ -25,22 +25,21 @@ async function main(): Promise<void> {
   app.use(cors());
   app.use(express.json());
 
-  const manager = new SessionManager();
+  const manager = new SessionManager({ defaultProjectPath: projectRoot });
   await manager.initialize(projectRoot);
-
-  const clients = new Map<string, Set<WebSocket>>();
-
-  function broadcast(sessionId: string, event: SessionEvent): void {
-    const sockets = clients.get(sessionId);
-    if (!sockets) return;
-    const data = JSON.stringify(event);
-    for (const ws of sockets) {
-      if (ws.readyState === WebSocket.OPEN) ws.send(data);
-    }
-  }
 
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", providers: manager.getProviders() });
+  });
+
+  app.get("/api/bootstrap", (_req, res) => {
+    res.json({
+      status: "ok",
+      providers: manager.getProviders(),
+      config: manager.getConfig(),
+      projects: manager.listProjects(),
+      threads: manager.listThreads(),
+    });
   });
 
   app.get("/api/config", (_req, res) => {
@@ -50,25 +49,69 @@ async function main(): Promise<void> {
   app.post("/api/config/keys", (req, res) => {
     const { providerId, apiKey } = req.body as { providerId: string; apiKey: string };
     manager.setApiKey(providerId, apiKey);
-    manager.initialize(projectRoot).then(() => res.json({ ok: true, providers: manager.getProviders() }));
+    res.json({ ok: true, providers: manager.getProviders() });
   });
 
-  app.get("/api/threads", (_req, res) => {
-    res.json(manager.listThreads());
+  app.get("/api/projects", (_req, res) => {
+    res.json(manager.listProjects());
+  });
+
+  app.post("/api/projects", (req, res) => {
+    try {
+      const { name, path } = req.body as { name?: string; path: string };
+      if (!path) return res.status(400).json({ error: "path is required" });
+      const project = manager.createProject({ name, path });
+      res.json(project);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.patch("/api/projects/:id", (req, res) => {
+    try {
+      const { name, path } = req.body as { name?: string; path?: string };
+      const project = manager.updateProject(req.params.id, { name, path });
+      res.json(project);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete("/api/projects/:id", (req, res) => {
+    try {
+      manager.deleteProject(req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get("/api/threads", (req, res) => {
+    const projectId = req.query.projectId as string | undefined;
+    res.json(manager.listThreads(projectId));
+  });
+
+  app.get("/api/threads/:id/messages", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    res.json(manager.getThreadMessages(req.params.id));
   });
 
   app.post("/api/threads", (req, res) => {
     try {
-      const { cwd, mode, model, providerId } = req.body as {
-        cwd: string;
+      const { projectId, cwd, mode, model, providerId } = req.body as {
+        projectId?: string;
+        cwd?: string;
         mode?: string;
         model?: string;
         providerId?: string;
       };
-      const session = manager.createThread({ cwd, mode, model, providerId });
+      const session = manager.createThread({ projectId, cwd, mode, model, providerId });
+      const thread = manager.getThread(session.id);
       res.json({
         id: session.id,
         cwd: session.cwd,
+        projectId: thread?.projectId,
         mode: session.getMode(),
         model: session.getModel(),
         status: session.getStatus(),
@@ -79,24 +122,31 @@ async function main(): Promise<void> {
   });
 
   app.post("/api/threads/:id/message", async (req, res) => {
-    const session = manager.getSession(req.params.id);
+    let session;
+    try {
+      session = manager.ensureSession(req.params.id);
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
     if (!session) return res.status(404).json({ error: "Thread not found" });
 
     const { message } = req.body as { message: string };
-    const unsubscribe = session.on((event) => broadcast(req.params.id, event));
 
     try {
       const result = await session.send(message);
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      unsubscribe();
     }
   });
 
   app.post("/api/threads/:id/mode", (req, res) => {
-    const session = manager.getSession(req.params.id);
+    let session;
+    try {
+      session = manager.ensureSession(req.params.id);
+    } catch (err) {
+      return res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
     if (!session) return res.status(404).json({ error: "Thread not found" });
     const { mode } = req.body as { mode: string };
     session.setMode(mode);
@@ -104,7 +154,7 @@ async function main(): Promise<void> {
   });
 
   app.post("/api/threads/:id/cancel", (req, res) => {
-    const session = manager.getSession(req.params.id);
+    const session = manager.ensureSession(req.params.id);
     if (!session) return res.status(404).json({ error: "Thread not found" });
     session.cancel();
     res.json({ ok: true });
@@ -127,9 +177,6 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (!clients.has(sessionId)) clients.set(sessionId, new Set());
-    clients.get(sessionId)!.add(ws);
-
     const unsubscribe = manager.subscribe(sessionId, (event) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(event));
@@ -137,7 +184,6 @@ async function main(): Promise<void> {
     });
 
     ws.on("close", () => {
-      clients.get(sessionId)?.delete(ws);
       unsubscribe();
     });
   });

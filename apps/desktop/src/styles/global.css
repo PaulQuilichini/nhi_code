@@ -23,11 +23,32 @@
   --error: #ef4444;
   --thinking: #a78bfa;
   --tool: #38bdf8;
+  --overlay: rgba(0, 0, 0, 0.6);
   --radius: 8px;
   --radius-lg: 12px;
   --font: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", monospace;
   --sidebar-width: 280px;
+}
+
+[data-theme="light"] {
+  --bg-primary: #f4f5f8;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #eef0f4;
+  --bg-hover: #e4e7ed;
+  --border: #d5dae3;
+  --text-primary: #12141a;
+  --text-secondary: #525868;
+  --text-muted: #7a8190;
+  --accent: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-dim: rgba(99, 102, 241, 0.12);
+  --success: #16a34a;
+  --warning: #d97706;
+  --error: #dc2626;
+  --thinking: #7c3aed;
+  --tool: #0284c7;
+  --overlay: rgba(15, 23, 42, 0.45);
 }
 
 html,

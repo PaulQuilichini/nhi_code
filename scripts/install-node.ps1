@@ -9,9 +9,7 @@ function Find-Node {
         (Get-Command node -ErrorAction SilentlyContinue)?.Source,
         "$env:ProgramFiles\nodejs\node.exe",
         "$env:LocalAppData\Programs\nodejs\node.exe",
-        "$env:LocalAppData\NHICode\nodejs\node.exe",
-        "$env:LocalAppData\SuprModl\nodejs\node.exe",
-        "$env:LocalAppData\SuperModel\nodejs\node.exe"
+        "$env:LocalAppData\NHICode\nodejs\node.exe"
     ) | Where-Object { $_ -and (Test-Path $_) }
 
     if ($candidates.Count -gt 0) {

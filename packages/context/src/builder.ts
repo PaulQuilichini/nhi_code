@@ -1,10 +1,13 @@
 import { readFile, access } from "node:fs/promises";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Message } from "@nhicode/shared";
+import { sanitizeMessageHistory, trimMessageHistory } from "./history.js";
 
 const execFileAsync = promisify(execFile);
+const PROJECT_DOC_MAX_BYTES = 32 * 1024;
 
 const BASE_SYSTEM_PROMPT = `You are NHI Code, an expert AI coding agent. NHI stands for Non-Human Intelligence. You help developers write, debug, and understand code in local projects.
 
@@ -67,7 +70,7 @@ export class ContextBuilder {
     userMessage: string,
     maxHistory = 40,
   ): Message[] {
-    const trimmed = history.slice(-maxHistory);
+    const trimmed = trimMessageHistory(history, maxHistory);
     return [
       { role: "system", content: systemPrompt },
       ...trimmed,
@@ -76,30 +79,73 @@ export class ContextBuilder {
   }
 
   compactHistory(messages: Message[], maxMessages = 30): Message[] {
-    if (messages.length <= maxMessages) return messages;
+    if (messages.length <= maxMessages) return sanitizeMessageHistory(messages);
 
-    // Keep first user message and last N messages
     const first = messages.find((m) => m.role === "user");
-    const recent = messages.slice(-maxMessages);
+    const recent = trimMessageHistory(messages, maxMessages);
     if (first && !recent.includes(first)) {
-      return [first, { role: "user", content: "[... earlier context truncated ...]" }, ...recent.slice(1)];
+      return [
+        first,
+        { role: "user", content: "[... earlier context truncated ...]" },
+        ...recent.filter((m) => m !== first),
+      ];
     }
     return recent;
   }
 
   private async loadAgentsMd(cwd: string): Promise<string | null> {
-    const paths = [join(cwd, "AGENTS.md"), join(cwd, ".nhicode", "AGENTS.md")];
-    // prior product dirs
-    paths.push(join(cwd, ".suprmodl", "AGENTS.md"), join(cwd, ".supermodel", "AGENTS.md"));
+    const parts: string[] = [];
+    let bytes = 0;
+
+    const append = (content: string): void => {
+      if (bytes >= PROJECT_DOC_MAX_BYTES) return;
+      const remaining = PROJECT_DOC_MAX_BYTES - bytes;
+      const next = Buffer.byteLength(content) > remaining ? content.slice(0, remaining) : content;
+      parts.push(next);
+      bytes += Buffer.byteLength(next);
+    };
+
+    const global = await this.readFirstInstruction([
+      join(homedir(), ".nhicode", "AGENTS.override.md"),
+      join(homedir(), ".nhicode", "AGENTS.md"),
+    ]);
+    if (global) append(global);
+
+    const root = await this.findProjectRoot(cwd);
+    for (const dir of instructionDirs(root, cwd)) {
+      const local = await this.readFirstInstruction([
+        join(dir, "AGENTS.override.md"),
+        join(dir, "AGENTS.md"),
+      ]);
+      if (local) append(local);
+    }
+
+    return parts.length > 0 ? parts.join("\n\n") : null;
+  }
+
+  private async readFirstInstruction(paths: string[]): Promise<string | null> {
     for (const p of paths) {
       try {
         await access(p);
-        return await readFile(p, "utf-8");
+        const content = await readFile(p, "utf-8");
+        if (content.trim()) return content;
       } catch {
         // not found
       }
     }
     return null;
+  }
+
+  private async findProjectRoot(cwd: string): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
+        cwd,
+        timeout: 5000,
+      });
+      return stdout.trim() || cwd;
+    } catch {
+      return cwd;
+    }
   }
 
   private async loadGitContext(cwd: string): Promise<string | null> {
@@ -117,6 +163,22 @@ export class ContextBuilder {
   reset(): void {
     this.systemPrompt = null;
   }
+}
+
+function instructionDirs(root: string, cwd: string): string[] {
+  const rootPath = resolve(root);
+  const cwdPath = resolve(cwd);
+  const rel = relative(rootPath, cwdPath);
+  if (rel.startsWith("..")) return [cwdPath];
+  if (!rel) return [rootPath];
+
+  const dirs = [rootPath];
+  let current = rootPath;
+  for (const segment of rel.split(/[\\/]+/)) {
+    current = join(current, segment);
+    dirs.push(current);
+  }
+  return dirs;
 }
 
 export const AGENT_PROFILES: Record<string, { mode: string; systemPrompt: string; maxTurns: number }> = {

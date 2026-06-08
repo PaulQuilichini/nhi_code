@@ -2,8 +2,6 @@ import { useState } from "react";
 import { setApiKey, type Config } from "../api";
 
 interface SettingsModalProps {
-  cwd: string;
-  onCwdChange: (cwd: string) => void;
   config: Config | null;
   providers: string[];
   onClose: () => void;
@@ -11,8 +9,6 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal({
-  cwd,
-  onCwdChange,
   config,
   providers,
   onClose,
@@ -37,16 +33,6 @@ export function SettingsModal({
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>Settings</h2>
-
-        <div className="modal-section">
-          <label>Project Directory</label>
-          <input
-            type="text"
-            value={cwd}
-            onChange={(e) => onCwdChange(e.target.value)}
-            placeholder="C:\Users\You\Projects\my-app"
-          />
-        </div>
 
         <div className="modal-section">
           <label>API Keys</label>

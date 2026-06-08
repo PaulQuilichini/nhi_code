@@ -33,7 +33,17 @@ const DEFAULT_CONFIG: NhiCodeConfig = {
       type: "openai-compatible",
       base_url: "https://api.moonshot.ai/v1",
       api_key_env: "MOONSHOT_API_KEY",
-      default_model: "kimi-k2.5",
+      default_model: "kimi-k2.6",
+      generation_config: {
+        thinking: { type: "enabled" },
+      },
+    },
+    {
+      id: "kimi-code",
+      type: "openai-compatible",
+      base_url: "https://api.kimi.com/coding/v1",
+      api_key_env: "KIMI_CODE_API_KEY",
+      default_model: "kimi-for-coding",
     },
     {
       id: "qwen",
@@ -63,43 +73,40 @@ const DEFAULT_CONFIG: NhiCodeConfig = {
   },
 };
 
-/** Prior product names — loaded silently so existing installs keep working. */
-const LEGACY_CONFIG_PATHS = (cwd?: string): string[] => {
-  const home = homedir();
-  const paths = [
-    join(home, ".suprmodl", "suprmodl.toml"),
-    join(home, ".supermodel", "supermodel.toml"),
-  ];
-  if (cwd) {
-    paths.push(join(cwd, ".suprmodl", "config.toml"));
-    paths.push(join(cwd, ".supermodel", "config.toml"));
-    paths.push(join(cwd, "suprmodl.toml"));
-    paths.push(join(cwd, "supermodel.toml"));
-  }
-  return paths;
-};
-
-export function getConfigPaths(cwd?: string): string[] {
+function canonicalPaths(cwd?: string): string[] {
   const paths = [join(homedir(), ".nhicode", "nhicode.toml")];
   if (cwd) {
     paths.unshift(join(cwd, ".nhicode", "config.toml"));
     paths.unshift(join(cwd, "nhicode.toml"));
   }
-  return [...paths, ...LEGACY_CONFIG_PATHS(cwd)];
+  return paths;
+}
+
+export function getConfigPaths(cwd?: string): string[] {
+  return canonicalPaths(cwd);
+}
+
+async function tryReadConfig(path: string): Promise<NhiCodeConfig | null> {
+  try {
+    await access(path);
+    const raw = await readFile(path, "utf-8");
+    const parsed = parseToml(raw) as Record<string, unknown>;
+    return NhiCodeConfigSchema.parse(parsed);
+  } catch {
+    return null;
+  }
 }
 
 export async function loadConfig(cwd?: string): Promise<NhiCodeConfig> {
-  const paths = getConfigPaths(cwd);
   let merged: NhiCodeConfig = structuredClone(DEFAULT_CONFIG);
 
-  for (const path of [...paths].reverse()) {
-    try {
-      await access(path);
-      const raw = await readFile(path, "utf-8");
-      const parsed = parseToml(raw) as Record<string, unknown>;
-      merged = deepMerge(merged, NhiCodeConfigSchema.parse(normalizeTomlKeys(parsed)));
-    } catch {
-      // file doesn't exist or invalid — skip
+  const canon = canonicalPaths(cwd);
+  const results = await Promise.all(canon.map((p) => tryReadConfig(p)));
+
+  for (let i = results.length - 1; i >= 0; i--) {
+    const cfg = results[i];
+    if (cfg) {
+      merged = deepMerge(merged, cfg);
     }
   }
 
@@ -111,25 +118,6 @@ export async function saveUserConfig(config: Partial<NhiCodeConfig>): Promise<st
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, stringifyToml(denormalizeTomlKeys(config)), "utf-8");
   return path;
-}
-
-function normalizeTomlKeys(obj: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    const camelKey = key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
-    if (Array.isArray(value)) {
-      result[camelKey] = value.map((item) =>
-        typeof item === "object" && item !== null
-          ? normalizeTomlKeys(item as Record<string, unknown>)
-          : item,
-      );
-    } else if (typeof value === "object" && value !== null) {
-      result[camelKey] = normalizeTomlKeys(value as Record<string, unknown>);
-    } else {
-      result[camelKey] = value;
-    }
-  }
-  return result;
 }
 
 function denormalizeTomlKeys(obj: Record<string, unknown>): Record<string, unknown> {

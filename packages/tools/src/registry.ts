@@ -1,7 +1,7 @@
 import { readFile, writeFile, readdir, mkdir } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { relative, resolve, dirname } from "node:path";
+import { relative, resolve, dirname, isAbsolute } from "node:path";
 import fg from "fast-glob";
 import type { ToolDefinition, ToolResult } from "@nhicode/shared";
 
@@ -10,7 +10,8 @@ const execFileAsync = promisify(execFile);
 export interface ToolContext {
   cwd: string;
   sessionId: string;
-  spawnSubAgent?: (profile: string, task: string) => Promise<string>;
+  toolCallId?: string;
+  spawnSubAgent?: (profile: string, task: string, toolCallId: string) => Promise<string>;
 }
 
 export interface ToolHandler {
@@ -23,6 +24,34 @@ function resolvePath(cwd: string, p: string): string {
     return resolve(p);
   }
   return resolve(cwd, p);
+}
+
+function isWithinWorkspace(cwd: string, targetPath: string): boolean {
+  const rel = relative(resolve(cwd), resolve(targetPath));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function assertWritableInWorkspace(cwd: string, targetPath: string): void {
+  if (!isWithinWorkspace(cwd, targetPath)) {
+    throw new Error(`Writes outside the workspace are blocked: ${targetPath}`);
+  }
+}
+
+function assertSafeShellCommand(command: string): void {
+  const normalized = command.trim().toLowerCase();
+  const dangerous = [
+    /\brm\s+-[^\r\n]*r[^\r\n]*f\b/,
+    /\brm\s+-[^\r\n]*f[^\r\n]*r\b/,
+    /\brmdir\s+\/s\b/,
+    /\bdel\s+\/[^\r\n]*[sq][^\r\n]*\b/,
+    /\bformat(?:\.com)?\b/,
+    /\bdiskpart\b/,
+    /\bshutdown\b/,
+    /\bpowershell(?:\.exe)?\b[^\r\n]*-encodedcommand\b/,
+  ];
+  if (dangerous.some((pattern) => pattern.test(normalized))) {
+    throw new Error("Potentially destructive shell command blocked");
+  }
 }
 
 export const toolDefinitions: ToolDefinition[] = [
@@ -155,7 +184,7 @@ export const toolDefinitions: ToolDefinition[] = [
     type: "function",
     function: {
       name: "git_commit",
-      description: "Stage all changes and create a git commit",
+      description: "Create a git commit from already staged changes",
       parameters: {
         type: "object",
         properties: {
@@ -251,6 +280,7 @@ async function readFileTool(args: Record<string, unknown>, ctx: ToolContext): Pr
 
 async function writeFileTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   const filePath = resolvePath(ctx.cwd, args.path as string);
+  assertWritableInWorkspace(ctx.cwd, filePath);
   await mkdir(dirname(filePath), { recursive: true });
   await writeFile(filePath, args.content as string, "utf-8");
   return `Wrote ${relative(ctx.cwd, filePath)} (${(args.content as string).length} bytes)`;
@@ -258,6 +288,7 @@ async function writeFileTool(args: Record<string, unknown>, ctx: ToolContext): P
 
 async function editFileTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   const filePath = resolvePath(ctx.cwd, args.path as string);
+  assertWritableInWorkspace(ctx.cwd, filePath);
   const content = await readFile(filePath, "utf-8");
   const oldStr = args.old_string as string;
   const newStr = args.new_string as string;
@@ -327,6 +358,7 @@ async function listDirTool(args: Record<string, unknown>, ctx: ToolContext): Pro
 
 async function shellTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
   const command = args.command as string;
+  assertSafeShellCommand(command);
   const isWin = process.platform === "win32";
   const { stdout, stderr } = await execFileAsync(
     isWin ? "cmd.exe" : "sh",
@@ -356,7 +388,6 @@ async function gitDiffTool(args: Record<string, unknown>, ctx: ToolContext): Pro
 }
 
 async function gitCommitTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-  await gitTool(["add", "-A"], ctx);
   return gitTool(["commit", "-m", args.message as string], ctx);
 }
 
@@ -364,7 +395,10 @@ async function spawnSubagentTool(args: Record<string, unknown>, ctx: ToolContext
   if (!ctx.spawnSubAgent) {
     throw new Error("Sub-agent spawning is not available in this context");
   }
-  return ctx.spawnSubAgent(args.profile as string, args.task as string);
+  if (!ctx.toolCallId) {
+    throw new Error("Sub-agent spawn requires tool call context");
+  }
+  return ctx.spawnSubAgent(args.profile as string, args.task as string, ctx.toolCallId);
 }
 
 export { toolDefinitions as definitions };

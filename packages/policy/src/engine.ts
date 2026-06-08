@@ -1,10 +1,13 @@
 import type {
+  ApprovalCategory,
   ApprovalPolicy,
+  ApprovalScope,
   ModeProfile,
   PolicyDecision,
   PolicyRule,
   ToolCall,
 } from "@nhicode/shared";
+import { TOOL_CATEGORY } from "@nhicode/shared";
 
 export const MODE_PROFILES: Record<string, ModeProfile> = {
   plan: {
@@ -19,7 +22,6 @@ export const MODE_PROFILES: Record<string, ModeProfile> = {
       "list_dir",
       "git_status",
       "git_diff",
-      "web_search",
     ],
     deniedTools: [
       "write_file",
@@ -55,15 +57,13 @@ Do NOT make changes. When the plan is ready, tell the user to switch to Agent mo
       "shell",
       "git_commit",
       "spawn_subagent",
-      "web_search",
-      "web_fetch",
     ],
     systemAddendum: `You are in Ask mode. Answer questions about the codebase using read-only tools. Do not suggest making changes unless asked.`,
   },
 };
 
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "shell", "git_commit", "spawn_subagent"]);
-const NETWORK_TOOLS = new Set(["web_fetch", "shell"]);
+const NETWORK_TOOLS = new Set(["shell"]);
 
 export interface PolicyContext {
   cwd: string;
@@ -76,6 +76,8 @@ export class PolicyEngine {
   private rules: PolicyRule[] = [];
   private sessionApprovals = new Set<string>();
   private projectApprovals = new Set<string>();
+  private sessionCategoryApprovals = new Set<ApprovalCategory>();
+  private projectCategoryApprovals = new Set<ApprovalCategory>();
   private approvalPolicy: ApprovalPolicy;
 
   constructor(modeName = "agent", rules: PolicyRule[] = []) {
@@ -103,6 +105,19 @@ export class PolicyEngine {
 
   approveProject(toolName: string): void {
     this.projectApprovals.add(toolName);
+  }
+
+  approveCategorySession(category: ApprovalCategory): void {
+    this.sessionCategoryApprovals.add(category);
+  }
+
+  approveCategoryProject(category: ApprovalCategory): void {
+    this.projectCategoryApprovals.add(category);
+  }
+
+  getAvailableScopes(_toolName: string): ApprovalScope[] {
+    // All scopes are always available; category scope shown in UI
+    return ["once", "session", "project"];
   }
 
   evaluate(toolCall: ToolCall, context: PolicyContext): PolicyDecision {
@@ -151,7 +166,13 @@ export class PolicyEngine {
     const sandboxDecision = this.checkSandbox(toolName, args, context);
     if (sandboxDecision) return sandboxDecision;
 
-    // Session/project approvals
+    // Category-level approvals (check before specific tool approvals — broader scope)
+    const category = TOOL_CATEGORY[toolName];
+    if (category && (this.sessionCategoryApprovals.has(category) || this.projectCategoryApprovals.has(category))) {
+      return { action: "allow" };
+    }
+
+    // Session/project approvals (specific tool)
     if (this.sessionApprovals.has(toolName) || this.projectApprovals.has(toolName)) {
       return { action: "allow" };
     }
@@ -210,7 +231,7 @@ export class PolicyEngine {
       }
     }
 
-    if (NETWORK_TOOLS.has(toolName) && toolName !== "web_search") {
+    if (NETWORK_TOOLS.has(toolName)) {
       return { action: "ask", scopes: ["once", "session"] };
     }
 
@@ -218,7 +239,6 @@ export class PolicyEngine {
   }
 
   private needsNetworkApproval(toolName: string, args: Record<string, unknown>): boolean {
-    if (toolName === "web_fetch") return true;
     if (toolName === "shell") {
       return this.isNetworkCommand((args.command as string) ?? "");
     }

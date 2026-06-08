@@ -1,17 +1,27 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import type { ChatMessage, ToolMessage } from "../App";
+import type { SessionStatus } from "@nhicode/shared";
+import type { ChatMessage, SubAgentMessage, ToolMessage, StatusNotice } from "../chatTypes";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallCard } from "./ToolCallCard";
+import { SubAgentCard } from "./SubAgentCard";
 import type { Config } from "../api";
+
+type ConnectionStatus = "connecting" | "connected" | "disconnected" | "reconnecting";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
-  isRunning: boolean;
+  sessionStatus: SessionStatus;
+  connectionStatus: ConnectionStatus;
+  activityLabel: string;
+  isBusy: boolean;
+  statusNotice: StatusNotice | null;
+  onDismissNotice: () => void;
   mode: string;
   model: string;
   providerId: string;
   config: Config | null;
+  projectName?: string;
   hasActiveThread: boolean;
   onSend: (text: string) => void;
   onModeChange: (mode: string) => void;
@@ -35,7 +45,7 @@ function isStreamingMessage(m: ChatMessage): boolean {
   return (m.role === "assistant" || m.role === "thinking") && !!m.isStreaming;
 }
 
-function groupMessages(messages: ChatMessage[], isRunning: boolean): RenderBlock[] {
+function groupMessages(messages: ChatMessage[], isBusy: boolean): RenderBlock[] {
   const blocks: RenderBlock[] = [];
   let agentItems: ChatMessage[] = [];
 
@@ -57,11 +67,7 @@ function groupMessages(messages: ChatMessage[], isRunning: boolean): RenderBlock
     }
   }
 
-  const lastIsUser = messages.length > 0 && messages[messages.length - 1].role === "user";
-  const hasRunningTools = agentItems.some(
-    (m) => m.role === "tool" && m.status === "running",
-  );
-  if (isRunning && (lastIsUser || hasRunningTools || agentItems.some(isStreamingMessage))) {
+  if (isBusy) {
     flushAgent(true);
   } else {
     flushAgent(false);
@@ -72,11 +78,17 @@ function groupMessages(messages: ChatMessage[], isRunning: boolean): RenderBlock
 
 export function ChatPanel({
   messages,
-  isRunning,
+  sessionStatus,
+  connectionStatus,
+  activityLabel,
+  isBusy,
+  statusNotice,
+  onDismissNotice,
   mode,
   model,
   providerId,
   config,
+  projectName,
   hasActiveThread,
   onSend,
   onModeChange,
@@ -90,11 +102,11 @@ export function ChatPanel({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isRunning]);
+  }, [messages, isBusy]);
 
   const handleSubmit = () => {
     const text = input.trim();
-    if (!text || isRunning) return;
+    if (!text || isBusy) return;
     setInput("");
     onSend(text);
   };
@@ -107,11 +119,18 @@ export function ChatPanel({
   };
 
   const modelOptions = config?.providers ?? [];
-  const blocks = groupMessages(messages, isRunning);
+  const blocks = groupMessages(messages, isBusy);
+  const showDisconnected =
+    connectionStatus === "disconnected" || connectionStatus === "reconnecting";
+  const statusText =
+    sessionStatus === "waiting_approval"
+      ? "Waiting for approval"
+      : activityLabel || (isBusy ? "Working…" : "Ready");
 
   return (
     <main className="chat-panel">
       <div className="chat-header">
+        {projectName && <span className="chat-project-label">{projectName}</span>}
         <div className="mode-selector">
           {MODES.map((m) => (
             <button
@@ -144,6 +163,39 @@ export function ChatPanel({
         </select>
       </div>
 
+      {hasActiveThread && (
+        <div className={`agent-status-bar ${isBusy ? "is-busy" : ""}`}>
+          <span className={`connection-dot ${connectionStatus}`} title={`Connection: ${connectionStatus}`} />
+          {isBusy && <span className="tool-spinner status-spinner" aria-hidden />}
+          <span className="activity-label">{statusText}</span>
+          {sessionStatus === "error" && !isBusy && (
+            <span className="status-badge status-badge-error">Error</span>
+          )}
+        </div>
+      )}
+
+      {hasActiveThread && statusNotice && (
+        <div className={`status-notice status-notice-${statusNotice.kind}`} role="alert">
+          <span className="status-notice-message">{statusNotice.message}</span>
+          <button
+            type="button"
+            className="status-notice-dismiss"
+            onClick={onDismissNotice}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {hasActiveThread && showDisconnected && isBusy && (
+        <div className="connection-banner">
+          {connectionStatus === "reconnecting"
+            ? "Reconnecting — agent is still running…"
+            : "Disconnected — trying to reconnect…"}
+        </div>
+      )}
+
       {!hasActiveThread ? (
         <div className="empty-state">
           <h2>NHI Code</h2>
@@ -161,7 +213,12 @@ export function ChatPanel({
             block.kind === "user" ? (
               <UserBubble key={block.message.id} content={block.message.content} />
             ) : (
-              <AgentTurn key={`turn-${idx}`} items={block.items} isActive={block.isActive} />
+              <AgentTurn
+                key={`turn-${idx}`}
+                items={block.items}
+                isActive={block.isActive}
+                activityLabel={activityLabel}
+              />
             ),
           )}
           <div ref={messagesEndRef} />
@@ -183,10 +240,10 @@ export function ChatPanel({
                     ? "Ask a question about the codebase…"
                     : "Tell the agent what to do…"
               }
-              disabled={isRunning}
+              disabled={isBusy}
               rows={1}
             />
-            {isRunning && (
+            {isBusy && (
               <button className="cancel-btn" onClick={onCancel}>
                 Cancel
               </button>
@@ -194,15 +251,24 @@ export function ChatPanel({
             <button
               className="send-btn"
               onClick={handleSubmit}
-              disabled={!input.trim() || isRunning}
+              disabled={!input.trim() || isBusy}
             >
               ↑
             </button>
           </div>
           <div className="input-hint">
-            {mode === "plan" && "Plan mode — read-only exploration, no file changes"}
-            {mode === "agent" && "Agent mode — can edit files and run commands with approval"}
-            {mode === "ask" && "Ask mode — read-only Q&A"}
+            {isBusy ? (
+              <span className="input-activity">
+                <span className="tool-spinner input-activity-spinner" aria-hidden />
+                {statusText}
+              </span>
+            ) : (
+              <>
+                {mode === "plan" && "Plan mode — read-only exploration, no file changes"}
+                {mode === "agent" && "Agent mode — can edit files and run commands with approval"}
+                {mode === "ask" && "Ask mode — read-only Q&A"}
+              </>
+            )}
           </div>
         </div>
       )}
@@ -218,10 +284,24 @@ function UserBubble({ content }: { content: string }) {
   );
 }
 
-function AgentTurn({ items, isActive }: { items: ChatMessage[]; isActive: boolean }) {
+function AgentTurn({
+  items,
+  isActive,
+  activityLabel,
+}: {
+  items: ChatMessage[];
+  isActive: boolean;
+  activityLabel: string;
+}) {
   const thinking = items.find((m) => m.role === "thinking");
+  const subagents = items.filter((m) => m.role === "subagent") as SubAgentMessage[];
   const tools = items.filter((m) => m.role === "tool") as ToolMessage[];
   const assistantParts = items.filter((m) => m.role === "assistant");
+  const isStreaming = items.some(isStreamingMessage);
+  const hasRunningTool = tools.some((t) => t.status === "running");
+  const hasRunningSubAgent = subagents.some((s) => s.status === "running");
+  const showFooter =
+    isActive && !isStreaming && (items.length === 0 || (!hasRunningTool && !hasRunningSubAgent));
 
   return (
     <div className={`agent-turn ${isActive ? "agent-turn-active" : ""}`}>
@@ -233,6 +313,14 @@ function AgentTurn({ items, isActive }: { items: ChatMessage[]; isActive: boolea
         />
       )}
 
+      {subagents.length > 0 && (
+        <div className="subagent-stack">
+          {subagents.map((sa) => (
+            <SubAgentCard key={sa.id} subagent={sa} />
+          ))}
+        </div>
+      )}
+
       {tools.length > 0 && (
         <div className="tool-stack">
           {tools.map((tool) => (
@@ -242,8 +330,12 @@ function AgentTurn({ items, isActive }: { items: ChatMessage[]; isActive: boolea
       )}
 
       {assistantParts.map((msg) => (
-        <div key={msg.id} className="message message-assistant">
+        <div
+          key={msg.id}
+          className={`message message-assistant ${msg.isError ? "message-error" : ""}`}
+        >
           <div className="message-content assistant-markdown">
+            {msg.isError && <div className="error-label">Agent stopped</div>}
             {msg.content ? <ReactMarkdown>{msg.content}</ReactMarkdown> : null}
             {msg.isStreaming && !msg.content && (
               <span className="working-indicator inline">
@@ -255,10 +347,10 @@ function AgentTurn({ items, isActive }: { items: ChatMessage[]; isActive: boolea
         </div>
       ))}
 
-      {isActive && items.length === 0 && (
-        <div className="working-indicator">
+      {showFooter && (
+        <div className="working-indicator turn-footer">
           <span className="tool-spinner" />
-          Working…
+          {activityLabel || "Working…"}
         </div>
       )}
     </div>

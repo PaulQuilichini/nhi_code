@@ -132,6 +132,8 @@ if not exist "apps\desktop\src-tauri\icons\icon.ico" (
   call pnpm --filter @nhicode/desktop icons 2>nul
 )
 
+call :FreePorts
+
 echo  Starting NHI Code desktop app...
 echo.
 echo  Press Ctrl+C to stop.
@@ -152,8 +154,6 @@ exit /b !EXIT_CODE!
 :FindNode
 set "NODE_DIR="
 if exist "%LocalAppData%\NHICode\nodejs\node.exe" set "NODE_DIR=%LocalAppData%\NHICode\nodejs"
-if not defined NODE_DIR if exist "%LocalAppData%\SuprModl\nodejs\node.exe" set "NODE_DIR=%LocalAppData%\SuprModl\nodejs"
-if not defined NODE_DIR if exist "%LocalAppData%\SuperModel\nodejs\node.exe" set "NODE_DIR=%LocalAppData%\SuperModel\nodejs"
 if not defined NODE_DIR if exist "%ProgramFiles%\nodejs\node.exe" set "NODE_DIR=%ProgramFiles%\nodejs"
 if not defined NODE_DIR if exist "%LocalAppData%\Programs\nodejs\node.exe" set "NODE_DIR=%LocalAppData%\Programs\nodejs"
 if not defined NODE_DIR (
@@ -163,6 +163,12 @@ if not defined NODE_DIR (
   )
 )
 :FindNodeDone
+exit /b 0
+
+:FreePorts
+REM Release stale Vite/API ports from a previous session that did not shut down cleanly.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ports = 5173, 3847; foreach ($port in $ports) { Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }"
 exit /b 0
 
 :InstallDeps

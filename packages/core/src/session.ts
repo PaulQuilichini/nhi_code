@@ -15,6 +15,7 @@ import type {
   TurnResult,
   Unsubscribe,
 } from "@nhicode/shared";
+import { TOOL_CATEGORY } from "@nhicode/shared";
 
 export interface AgentEngineOptions {
   maxTurns?: number;
@@ -42,6 +43,7 @@ export class Session {
   private options: AgentEngineOptions;
   private depth: number;
   private title: string;
+  private agentProfile?: string;
 
   constructor(
     config: SessionConfig,
@@ -64,6 +66,7 @@ export class Session {
     this.options = options;
     this.depth = depth;
     this.title = "New thread";
+    this.agentProfile = config.agentProfile;
     this.policy.setMode(this.mode);
   }
 
@@ -85,6 +88,11 @@ export class Session {
 
   getHistory(): Message[] {
     return [...this.history];
+  }
+
+  restoreHistory(messages: Message[], title?: string): void {
+    this.history = [...messages];
+    if (title) this.title = title;
   }
 
   setMode(mode: string): void {
@@ -124,7 +132,13 @@ export class Session {
 
     try {
       const result = await this.runLoop(message);
-      this.setStatus("completed");
+      if (result.status === "cancelled") {
+        this.setStatus("cancelled");
+      } else if (result.status === "error") {
+        this.setStatus("error");
+      } else {
+        this.setStatus("completed");
+      }
       this.emit({ type: "turn_complete", result });
       return result;
     } catch (err) {
@@ -137,6 +151,10 @@ export class Session {
 
   cancel(): void {
     this.abortController?.abort();
+    for (const [requestId, pending] of this.pendingApprovals) {
+      pending.resolve({ requestId, decision: "deny" });
+    }
+    this.pendingApprovals.clear();
     this.setStatus("cancelled");
   }
 
@@ -150,9 +168,11 @@ export class Session {
 
   private async runLoop(userMessage: string): Promise<TurnResult> {
     const modeProfile = this.policy.getMode();
+    const profileDef = this.agentProfile ? AGENT_PROFILES[this.agentProfile] : undefined;
     const systemPrompt = await this.context.buildSystemPrompt({
       cwd: this.cwd,
       modeAddendum: modeProfile.systemAddendum,
+      agentPrompt: profileDef?.systemPrompt,
     });
 
     let messages = this.context.buildMessages(systemPrompt, this.history, userMessage);
@@ -177,6 +197,7 @@ export class Session {
         messages,
         tools: this.tools.getDefinitions(),
         stream: true,
+        signal: this.abortController?.signal,
       })) {
         if (this.abortController?.signal.aborted) break;
 
@@ -194,14 +215,28 @@ export class Session {
           case "done":
             assistantMessage = event.message;
             if (turnText) assistantMessage.content = turnText;
+            if (turnThinking && assistantMessage.tool_calls?.length) {
+              assistantMessage.reasoning_content = turnThinking;
+            }
+            if (assistantMessage.tool_calls?.length && !assistantMessage.content) {
+              assistantMessage.content = null;
+            }
             break;
           case "error":
             throw new Error(event.error);
         }
       }
 
+      if (this.abortController?.signal.aborted) {
+        return { text: fullText, thinking: fullThinking, toolCalls: allToolCalls, status: "cancelled" };
+      }
+
       if (!assistantMessage) {
-        assistantMessage = { role: "assistant", content: turnText || null };
+        assistantMessage = {
+          role: "assistant",
+          content: turnText || null,
+          reasoning_content: undefined,
+        };
       }
 
       if (assistantMessage.tool_calls?.length) {
@@ -286,7 +321,8 @@ export class Session {
     const result = await this.tools.execute(call.function.name, args, {
       cwd: this.cwd,
       sessionId: this.id,
-      spawnSubAgent: (profile, task) => this.spawnSubAgent(profile, task),
+      toolCallId: call.id,
+      spawnSubAgent: (profile, task, toolCallId) => this.spawnSubAgent(profile, task, toolCallId),
     });
 
     result.toolCallId = call.id;
@@ -295,11 +331,12 @@ export class Session {
 
   private async requestApproval(call: ToolCall, scopes: ApprovalScope[]): Promise<boolean> {
     const requestId = randomUUID();
+    const category = TOOL_CATEGORY[call.function.name] ?? "file";
     this.setStatus("waiting_approval");
 
     const response = await new Promise<ApprovalResponse>((resolve) => {
       this.pendingApprovals.set(requestId, { call, resolve });
-      this.emit({ type: "approval_required", call, scopes, requestId });
+      this.emit({ type: "approval_required", call, scopes, requestId, category });
     });
 
     this.setStatus("running");
@@ -313,12 +350,18 @@ export class Session {
       case "approve_project":
         this.policy.approveProject(call.function.name);
         return true;
+      case "approve_category_session":
+        this.policy.approveCategorySession(response.category ?? category);
+        return true;
+      case "approve_category_project":
+        this.policy.approveCategoryProject(response.category ?? category);
+        return true;
       case "deny":
         return false;
     }
   }
 
-  async spawnSubAgent(profileName: string, task: string): Promise<string> {
+  async spawnSubAgent(profileName: string, task: string, toolCallId: string): Promise<string> {
     const maxDepth = this.options.maxDepth ?? 1;
     if (this.depth >= maxDepth) {
       return "Error: Maximum sub-agent depth reached";
@@ -333,19 +376,46 @@ export class Session {
       return `Error: Unknown sub-agent profile '${profileName}'`;
     }
 
-    this.emit({ type: "subagent_spawned", sessionId: "", profile: profileName });
-
     const child = await this.options.onSpawnSubAgent(this.id, {
       profile: profileName,
       task,
+      toolCallId,
       inheritPolicy: true,
       inheritCwd: true,
       inheritModel: true,
     });
 
-    const result = await child.send(task);
-    this.emit({ type: "subagent_completed", sessionId: child.id, result: result.text });
+    this.emit({
+      type: "subagent_spawned",
+      sessionId: child.id,
+      profile: profileName,
+      task,
+      toolCallId,
+    });
 
-    return result.text || result.error || "(sub-agent completed with no output)";
+    const forward = child.on((event) => {
+      this.emit({
+        type: "subagent_event",
+        childSessionId: child.id,
+        profile: profileName,
+        toolCallId,
+        event,
+      });
+    });
+
+    try {
+      const result = await child.send(task);
+      const summary = result.text || result.error || "(sub-agent completed with no output)";
+      this.emit({
+        type: "subagent_completed",
+        sessionId: child.id,
+        profile: profileName,
+        toolCallId,
+        result: summary,
+      });
+      return summary;
+    } finally {
+      forward();
+    }
   }
 }

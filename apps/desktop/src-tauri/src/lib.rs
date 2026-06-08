@@ -156,9 +156,6 @@ fn node_candidates() -> Vec<PathBuf> {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             let local = PathBuf::from(local);
             paths.push(local.join("NHICode").join("nodejs").join("node.exe"));
-            // prior install locations
-            paths.push(local.join("SuprModl").join("nodejs").join("node.exe"));
-            paths.push(local.join("SuperModel").join("nodejs").join("node.exe"));
         }
         if let Ok(pf) = std::env::var("ProgramFiles") {
             paths.push(PathBuf::from(pf).join("nodejs").join("node.exe"));
@@ -172,8 +169,6 @@ fn node_candidates() -> Vec<PathBuf> {
         if let Ok(home) = std::env::var("HOME") {
             let share = PathBuf::from(home).join(".local").join("share");
             paths.push(share.join("nhicode").join("nodejs").join("bin").join("node"));
-            paths.push(share.join("suprmodl").join("nodejs").join("bin").join("node"));
-            paths.push(share.join("supermodel").join("nodejs").join("bin").join("node"));
         }
     }
 

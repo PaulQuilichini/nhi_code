@@ -134,6 +134,9 @@ importers:
 
   packages/models:
     dependencies:
+      '@nhicode/context':
+        specifier: workspace:*
+        version: link:../context
       '@nhicode/shared':
         specifier: workspace:*
         version: link:../shared

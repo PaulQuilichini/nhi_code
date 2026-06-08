@@ -9,13 +9,22 @@ type = "openai-compatible"
 base_url = "https://api.deepseek.com"
 api_key_env = "DEEPSEEK_API_KEY"
 default_model = "deepseek-v4-pro"
+generation_config = { reasoning_effort = "high", thinking = { type = "enabled" } }
 
 [[providers]]
 id = "kimi"
 type = "openai-compatible"
 base_url = "https://api.moonshot.ai/v1"
 api_key_env = "MOONSHOT_API_KEY"
-default_model = "kimi-k2.5"
+default_model = "kimi-k2.6"
+generation_config = { thinking = { type = "enabled" } }
+
+[[providers]]
+id = "kimi-code"
+type = "openai-compatible"
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "KIMI_CODE_API_KEY"
+default_model = "kimi-for-coding"
 
 [[providers]]
 id = "qwen"

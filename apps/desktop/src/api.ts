@@ -1,4 +1,4 @@
-import type { ApprovalResponse, SessionEvent, ThreadSummary } from "@nhicode/shared";
+import type { ApprovalResponse, Project, SessionEvent, ThreadSummary } from "@nhicode/shared";
 
 /** Native Tauri app talks to the local API server directly (not via browser proxy). */
 function isTauriApp(): boolean {
@@ -13,17 +13,108 @@ export async function fetchHealth(): Promise<{ status: string; providers: string
   return res.json();
 }
 
-export async function fetchThreads(): Promise<ThreadSummary[]> {
-  const res = await fetch(`${API}/threads`);
+export interface BootstrapResponse {
+  status: string;
+  providers: string[];
+  config: Config;
+  projects: Project[];
+  threads: ThreadSummary[];
+}
+
+export async function fetchBootstrap(): Promise<BootstrapResponse> {
+  const res = await fetch(`${API}/bootstrap`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to load app state");
+  }
+  return res.json();
+}
+
+export async function fetchProjects(): Promise<Project[]> {
+  const res = await fetch(`${API}/projects`);
+  return res.json();
+}
+
+export async function createProject(opts: {
+  name?: string;
+  path: string;
+}): Promise<Project> {
+  const res = await fetch(`${API}/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to create project");
+  }
+  return res.json();
+}
+
+export async function updateProject(
+  id: string,
+  patch: { name?: string; path?: string },
+): Promise<Project> {
+  const res = await fetch(`${API}/projects/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to update project");
+  }
+  return res.json();
+}
+
+export async function deleteProject(id: string): Promise<void> {
+  const res = await fetch(`${API}/projects/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to delete project");
+  }
+}
+
+export async function fetchThreads(projectId?: string): Promise<ThreadSummary[]> {
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+  const res = await fetch(`${API}/threads${query}`);
+  return res.json();
+}
+
+export interface StoredMessageDto {
+  threadId: string;
+  role: string;
+  content: string | null;
+  reasoningContent?: string;
+  toolCalls?: string;
+  toolCallId?: string;
+  name?: string;
+  createdAt: string;
+}
+
+export async function fetchThreadMessages(threadId: string): Promise<StoredMessageDto[]> {
+  const res = await fetch(`${API}/threads/${threadId}/messages`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to load messages");
+  }
   return res.json();
 }
 
 export async function createThread(opts: {
-  cwd: string;
+  projectId?: string;
+  cwd?: string;
   mode?: string;
   model?: string;
   providerId?: string;
-}): Promise<{ id: string; cwd: string; mode: string; model: string; status: string }> {
+}): Promise<{
+  id: string;
+  cwd: string;
+  projectId?: string;
+  mode: string;
+  model: string;
+  status: string;
+}> {
   const res = await fetch(`${API}/threads`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -88,12 +179,20 @@ export async function setApiKey(providerId: string, apiKey: string): Promise<str
 export function connectWebSocket(
   sessionId: string,
   onEvent: (event: SessionEvent) => void,
+  callbacks?: {
+    onOpen?: () => void;
+    onClose?: (event: CloseEvent) => void;
+    onError?: (event: Event) => void;
+  },
 ): WebSocket {
   const wsUrl = isTauriApp()
     ? `ws://127.0.0.1:3847/ws?sessionId=${sessionId}`
     : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws?sessionId=${sessionId}`;
 
   const ws = new WebSocket(wsUrl);
+  ws.onopen = () => callbacks?.onOpen?.();
+  ws.onclose = (e) => callbacks?.onClose?.(e);
+  ws.onerror = (e) => callbacks?.onError?.(e);
   ws.onmessage = (msg) => {
     try {
       onEvent(JSON.parse(msg.data) as SessionEvent);

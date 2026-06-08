@@ -8,6 +8,7 @@ import type {
   ModelProviderConfig,
   ToolCall,
 } from "@nhicode/shared";
+import { sanitizeMessageHistory } from "@nhicode/context";
 
 export interface ModelProvider {
   id: string;
@@ -30,23 +31,23 @@ const KNOWN_MODELS: Record<string, Partial<ModelInfo>> = {
     maxOutput: 128_000,
     capabilities: { toolCalling: true, thinking: true, streaming: true },
   },
-  "deepseek-v4-r1": {
-    name: "DeepSeek V4 R1",
-    maxContext: 1_000_000,
-    maxOutput: 384_000,
-    capabilities: { toolCalling: true, thinking: true, streaming: true },
-  },
   "kimi-k2.5": {
     name: "Kimi K2.5",
     maxContext: 256_000,
     maxOutput: 32_000,
-    capabilities: { toolCalling: true, thinking: false, streaming: true },
+    capabilities: { toolCalling: true, thinking: true, streaming: true },
   },
   "kimi-k2.6": {
     name: "Kimi K2.6",
     maxContext: 256_000,
     maxOutput: 32_000,
-    capabilities: { toolCalling: true, thinking: false, streaming: true },
+    capabilities: { toolCalling: true, thinking: true, streaming: true },
+  },
+  "kimi-for-coding": {
+    name: "Kimi Code",
+    maxContext: 256_000,
+    maxOutput: 32_000,
+    capabilities: { toolCalling: true, thinking: true, streaming: true },
   },
   "qwen3-coder-plus": {
     name: "Qwen3 Coder Plus",
@@ -103,7 +104,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
       });
     } catch {
       return Object.entries(KNOWN_MODELS)
-        .filter(([id]) => id.includes(this.providerLabel) || this.providerLabel === "custom")
+        .filter(([id]) => matchesProviderModel(this.providerLabel, id))
         .map(([id, info]) => ({
           id,
           name: info.name ?? id,
@@ -117,22 +118,29 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   async *chat(request: ChatRequest): AsyncIterable<ChatEvent> {
     const model = request.model || this.defaultModel;
-    const openaiMessages = request.messages.map(toOpenAIMessage);
+    const [system, dialog] = splitSystemMessages(request.messages);
+    const openaiMessages = [
+      ...system.map(toOpenAIMessage),
+      ...sanitizeMessageHistory(dialog).map(toOpenAIMessage),
+    ];
 
     try {
-      const stream = await this.client.chat.completions.create({
-        model,
-        messages: openaiMessages,
-        tools: request.tools as OpenAI.ChatCompletionTool[] | undefined,
-        temperature: request.temperature ?? 0.2,
-        max_tokens: request.maxTokens,
-        stream: true,
-        ...this.generationConfig,
-      });
+      const stream = await this.client.chat.completions.create(
+        buildStreamParams({
+          model,
+          messages: openaiMessages,
+          tools: request.tools as OpenAI.ChatCompletionTool[] | undefined,
+          temperature: request.temperature,
+          maxTokens: request.maxTokens,
+          generationConfig: this.generationConfig,
+        }),
+        { signal: request.signal },
+      );
 
       let fullContent = "";
       let fullThinking = "";
       const toolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map();
+      let doneEmitted = false;
 
       for await (const chunk of stream) {
         const choice = chunk.choices[0];
@@ -140,16 +148,22 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
         const delta = choice.delta;
 
-        // Reasoning/thinking content (DeepSeek, Qwen)
+        // Reasoning/thinking content (DeepSeek V4, Qwen)
         const reasoning = (delta as Record<string, unknown>).reasoning_content;
         if (typeof reasoning === "string" && reasoning) {
-          fullThinking += reasoning;
-          yield { type: "thinking_delta", content: reasoning };
+          const thinkingUpdate = appendStreamDelta(fullThinking, reasoning);
+          if (thinkingUpdate.increment) {
+            fullThinking = thinkingUpdate.next;
+            yield { type: "thinking_delta", content: thinkingUpdate.increment };
+          }
         }
 
         if (delta.content) {
-          fullContent += delta.content;
-          yield { type: "text_delta", content: delta.content };
+          const textUpdate = appendStreamDelta(fullContent, delta.content);
+          if (textUpdate.increment) {
+            fullContent = textUpdate.next;
+            yield { type: "text_delta", content: textUpdate.increment };
+          }
         }
 
         if (delta.tool_calls) {
@@ -173,7 +187,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
           }
         }
 
-        if (choice.finish_reason) {
+        if (choice.finish_reason && !doneEmitted) {
+          doneEmitted = true;
           const messageToolCalls: ToolCall[] = Array.from(toolCalls.entries())
             .sort(([a], [b]) => a - b)
             .map(([, tc]) => ({
@@ -184,7 +199,9 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
           const message: Message = {
             role: "assistant",
-            content: fullContent || null,
+            content: fullContent || (messageToolCalls.length > 0 ? null : ""),
+            reasoning_content:
+              fullThinking && messageToolCalls.length > 0 ? fullThinking : undefined,
             tool_calls: messageToolCalls.length > 0 ? messageToolCalls : undefined,
           };
 
@@ -202,6 +219,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
         }
       }
     } catch (err) {
+      if (request.signal?.aborted) {
+        yield { type: "error", error: "Request cancelled" };
+        return;
+      }
       yield { type: "error", error: err instanceof Error ? err.message : String(err) };
     }
   }
@@ -212,26 +233,85 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 }
 
+function appendStreamDelta(
+  buffer: string,
+  chunk: string,
+): { next: string; increment: string | null } {
+  if (!chunk) return { next: buffer, increment: null };
+  if (!buffer) return { next: chunk, increment: chunk };
+  if (chunk.length >= buffer.length && chunk.startsWith(buffer)) {
+    return { next: chunk, increment: chunk.slice(buffer.length) };
+  }
+  if (chunk === buffer || buffer.endsWith(chunk)) {
+    return { next: buffer, increment: null };
+  }
+  if (chunk.startsWith(buffer)) {
+    return { next: chunk, increment: chunk.slice(buffer.length) };
+  }
+  return { next: buffer + chunk, increment: chunk };
+}
+
+function buildStreamParams(opts: {
+  model: string;
+  messages: OpenAI.ChatCompletionMessageParam[];
+  tools?: OpenAI.ChatCompletionTool[];
+  temperature?: number;
+  maxTokens?: number;
+  generationConfig: Record<string, unknown>;
+}): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming {
+  const { thinking, reasoning_effort, enable_thinking, ...rest } = opts.generationConfig;
+
+  return {
+    model: opts.model,
+    messages: opts.messages,
+    stream: true,
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    ...(opts.tools?.length ? { tools: opts.tools } : {}),
+    ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+    ...rest,
+    ...(reasoning_effort !== undefined ? { reasoning_effort } : {}),
+    ...(thinking !== undefined ? { thinking } : {}),
+    ...(enable_thinking !== undefined ? { enable_thinking } : {}),
+  } as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+}
+
+function splitSystemMessages(messages: Message[]): [Message[], Message[]] {
+  const system: Message[] = [];
+  const rest: Message[] = [];
+  for (const msg of messages) {
+    if (msg.role === "system") system.push(msg);
+    else rest.push(msg);
+  }
+  return [system, rest];
+}
+
 function toOpenAIMessage(msg: Message): OpenAI.ChatCompletionMessageParam {
+  const reasoning = msg.reasoning_content
+    ? { reasoning_content: msg.reasoning_content }
+    : {};
   switch (msg.role) {
     case "system":
       return { role: "system", content: msg.content ?? "" };
     case "user":
       return { role: "user", content: msg.content ?? "" };
     case "assistant":
+      if (msg.tool_calls?.length) {
+        return {
+          role: "assistant",
+          content: msg.content ?? null,
+          ...reasoning,
+          tool_calls: msg.tool_calls.map((tc) => ({
+            id: tc.id,
+            type: "function" as const,
+            function: { name: tc.function.name, arguments: tc.function.arguments },
+          })),
+        } as unknown as OpenAI.ChatCompletionMessageParam;
+      }
       return {
         role: "assistant",
-        content: msg.content,
-        ...(msg.tool_calls?.length
-          ? {
-              tool_calls: msg.tool_calls.map((tc) => ({
-                id: tc.id,
-                type: "function" as const,
-                function: { name: tc.function.name, arguments: tc.function.arguments },
-              })),
-            }
-          : {}),
-      };
+        content: msg.content ?? "",
+        ...reasoning,
+      } as unknown as OpenAI.ChatCompletionMessageParam;
     case "tool":
       return {
         role: "tool",
@@ -240,6 +320,14 @@ function toOpenAIMessage(msg: Message): OpenAI.ChatCompletionMessageParam {
         ...(msg.name ? { name: msg.name } : {}),
       };
   }
+}
+
+function matchesProviderModel(providerLabel: string, modelId: string): boolean {
+  if (providerLabel === "deepseek") return modelId.startsWith("deepseek-");
+  if (providerLabel === "kimi") return modelId.startsWith("kimi-k2");
+  if (providerLabel === "kimi-code") return modelId === "kimi-for-coding";
+  if (providerLabel === "qwen") return modelId.startsWith("qwen");
+  return modelId.startsWith(providerLabel) || modelId.includes(providerLabel);
 }
 
 export function createProvider(

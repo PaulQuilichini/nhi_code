@@ -5,6 +5,7 @@ import { z } from "zod";
 export interface Message {
   role: "system" | "user" | "assistant" | "tool";
   content: string | null;
+  reasoning_content?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -59,6 +60,7 @@ export interface ChatRequest {
   temperature?: number;
   maxTokens?: number;
   stream?: boolean;
+  signal?: AbortSignal;
 }
 
 export type ChatEvent =
@@ -94,6 +96,31 @@ export type PolicyDecision =
   | { action: "ask"; scopes: ApprovalScope[] };
 
 export type ApprovalScope = "once" | "session" | "project";
+
+/** Groups tools into categories for broader approval. */
+export type ApprovalCategory = "file" | "shell" | "git" | "web" | "agent";
+
+export const TOOL_CATEGORY: Record<string, ApprovalCategory> = {
+  read_file: "file",
+  write_file: "file",
+  edit_file: "file",
+  glob: "file",
+  grep: "file",
+  list_dir: "file",
+  shell: "shell",
+  git_status: "git",
+  git_diff: "git",
+  git_commit: "git",
+  spawn_subagent: "agent",
+};
+
+export const CATEGORY_LABEL: Record<ApprovalCategory, string> = {
+  file: "File operations",
+  shell: "Shell commands",
+  git: "Git operations",
+  web: "Web access",
+  agent: "Sub-agents",
+};
 
 export interface ModeProfile {
   name: string;
@@ -138,6 +165,7 @@ export interface SessionConfig {
 export interface SubAgentConfig {
   profile: string;
   task: string;
+  toolCallId?: string;
   inheritPolicy?: boolean;
   inheritCwd?: boolean;
   inheritModel?: boolean;
@@ -158,10 +186,11 @@ export type SessionEvent =
   | { type: "thinking_delta"; content: string }
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
-  | { type: "approval_required"; call: ToolCall; scopes: ApprovalScope[]; requestId: string }
+  | { type: "approval_required"; call: ToolCall; scopes: ApprovalScope[]; requestId: string; category: ApprovalCategory }
   | { type: "mode_changed"; mode: string }
-  | { type: "subagent_spawned"; sessionId: string; profile: string }
-  | { type: "subagent_completed"; sessionId: string; result: string }
+  | { type: "subagent_spawned"; sessionId: string; profile: string; task: string; toolCallId: string }
+  | { type: "subagent_event"; childSessionId: string; profile: string; toolCallId: string; event: SessionEvent }
+  | { type: "subagent_completed"; sessionId: string; profile: string; toolCallId: string; result: string }
   | { type: "status_changed"; status: SessionStatus }
   | { type: "turn_complete"; result: TurnResult }
   | { type: "error"; error: string };
@@ -217,12 +246,22 @@ export const NhiCodeConfigSchema = z.object({
 export type NhiCodeConfig = z.infer<typeof NhiCodeConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
+export interface Project {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ThreadSummary {
   id: string;
   title: string;
   cwd: string;
+  projectId?: string;
   mode: string;
   model: string;
+  providerId?: string;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;
@@ -234,9 +273,17 @@ export interface ApprovalRequest {
   sessionId: string;
   toolCall: ToolCall;
   scopes: ApprovalScope[];
+  category: ApprovalCategory;
 }
 
 export interface ApprovalResponse {
   requestId: string;
-  decision: "approve_once" | "approve_session" | "approve_project" | "deny";
+  decision:
+    | "approve_once"
+    | "approve_session"
+    | "approve_project"
+    | "approve_category_session"
+    | "approve_category_project"
+    | "deny";
+  category?: ApprovalCategory;
 }
