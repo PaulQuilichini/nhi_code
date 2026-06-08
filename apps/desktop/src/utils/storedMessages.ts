@@ -1,10 +1,16 @@
-import type { ToolCall } from "@nhicode/shared";
+import type { ObservationRecord, ToolCall } from "@nhicode/shared";
 import type { StoredMessageDto } from "../api";
 import type { ChatMessage } from "../chatTypes";
 import { parseSubAgentArgs } from "./subagentStream";
 
-export function storedMessagesToChat(messages: StoredMessageDto[]): ChatMessage[] {
+export function storedMessagesToChat(
+  messages: StoredMessageDto[],
+  observations: ObservationRecord[] = [],
+): ChatMessage[] {
   const chat: ChatMessage[] = [];
+  const observationsByToolCallId = new Map(
+    observations.map((obs) => [obs.toolCallId, obs]),
+  );
 
   for (const msg of messages) {
     if (msg.role === "user") {
@@ -55,6 +61,7 @@ export function storedMessagesToChat(messages: StoredMessageDto[]): ChatMessage[
 
     if (msg.role === "tool") {
       const toolCallId = msg.toolCallId ?? msg.name ?? "";
+      const observation = observationsByToolCallId.get(toolCallId);
       const subIdx = chat.findIndex(
         (m) => m.role === "subagent" && m.toolCallId === toolCallId && m.status === "running",
       );
@@ -63,7 +70,7 @@ export function storedMessagesToChat(messages: StoredMessageDto[]): ChatMessage[
         if (sa.role === "subagent") {
           chat[subIdx] = {
             ...sa,
-            result: msg.content ?? undefined,
+            result: observation?.content ?? msg.content ?? undefined,
             status: "done",
           };
         }
@@ -78,8 +85,11 @@ export function storedMessagesToChat(messages: StoredMessageDto[]): ChatMessage[
         if (tool.role === "tool") {
           chat[idx] = {
             ...tool,
-            result: msg.content ?? undefined,
+            result: observation?.content ?? msg.content ?? undefined,
             status: "done",
+            observationId: observation?.id,
+            rawContentLength: observation?.content.length,
+            compacted: Boolean(observation),
           };
         }
       }

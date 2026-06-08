@@ -9,6 +9,9 @@ export interface ToolCallMessage {
   result?: string;
   status: "running" | "done" | "error";
   isError?: boolean;
+  observationId?: string;
+  rawContentLength?: number;
+  compacted?: boolean;
 }
 
 interface ToolCallCardProps {
@@ -42,11 +45,22 @@ export function ToolCallCard({ tool }: ToolCallCardProps) {
         {resultSummary && tool.status !== "running" && (
           <span className="tool-result-preview">{resultSummary}</span>
         )}
+        {tool.observationId && (
+          <span className="tool-observation-id" title="Raw output stored locally">
+            {tool.observationId}
+          </span>
+        )}
         <span className="tool-chevron">{expanded ? "▾" : "▸"}</span>
       </button>
 
       {expanded && (
         <div className="tool-card-body">
+          {tool.observationId && (
+            <div className="tool-detail">
+              Raw output stored as {tool.observationId}
+              {tool.rawContentLength ? ` (${tool.rawContentLength} chars)` : ""}
+            </div>
+          )}
           {display.diff && (display.diff.oldText || display.diff.newText) && (
             <div className="diff-view">
               {display.diff.oldText && (
@@ -87,4 +101,53 @@ export function ToolCallCard({ tool }: ToolCallCardProps) {
       )}
     </div>
   );
+}
+
+export function ToolCallGroup({ tools }: { tools: ToolCallMessage[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const runningCount = tools.filter((tool) => tool.status === "running").length;
+  const errorCount = tools.filter((tool) => tool.isError || tool.status === "error").length;
+  const summary = summarizeToolGroup(tools);
+
+  return (
+    <div className={`tool-group ${expanded ? "is-expanded" : ""}`}>
+      <button
+        type="button"
+        className="tool-group-header"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span className="tool-chevron">{expanded ? "▾" : "▸"}</span>
+        <span className="tool-group-title">{tools.length} tool calls</span>
+        <span className="tool-group-summary">{summary}</span>
+        {runningCount > 0 && <span className="tool-spinner" />}
+        {errorCount > 0 && <span className="tool-group-error">{errorCount} error{errorCount === 1 ? "" : "s"}</span>}
+      </button>
+      {expanded && (
+        <div className="tool-group-body">
+          {tools.map((tool) => (
+            <ToolCallCard key={tool.id} tool={tool} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function summarizeToolGroup(tools: ToolCallMessage[]): string {
+  const counts = new Map<string, number>();
+  for (const tool of tools) {
+    counts.set(tool.toolName, (counts.get(tool.toolName) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 4)
+    .map(([name, count]) => `${count} ${toolLabel(name, count)}`)
+    .join(", ");
+}
+
+function toolLabel(name: string, count: number): string {
+  const display = getToolDisplay(name, "{}");
+  const label = display.label.toLocaleLowerCase();
+  return count === 1 ? label : `${label}s`;
 }

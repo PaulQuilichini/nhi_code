@@ -1,11 +1,16 @@
-import { readFile, writeFile, readdir, mkdir } from "node:fs/promises";
+import { readFile, writeFile, readdir, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { relative, resolve, dirname, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
+import { relative, resolve, dirname, isAbsolute, join } from "node:path";
 import fg from "fast-glob";
 import type { ToolDefinition, ToolResult } from "@nhicode/shared";
 
 const execFileAsync = promisify(execFile);
+const DEFAULT_SHELL_TIMEOUT_MS = 120_000;
+const MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024;
+const DEFAULT_READ_LIMIT = 200;
+const MAX_READ_LIMIT = 2_000;
 
 export interface ToolContext {
   cwd: string;
@@ -59,7 +64,7 @@ export const toolDefinitions: ToolDefinition[] = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read the contents of a file at the given path",
+      description: "Read a bounded range from a file at the given path. Defaults to 200 lines; pass offset and limit to inspect specific ranges.",
       parameters: {
         type: "object",
         properties: {
@@ -149,13 +154,28 @@ export const toolDefinitions: ToolDefinition[] = [
     type: "function",
     function: {
       name: "shell",
-      description: "Execute a shell command in the workspace directory",
+      description: "Execute a shell command or transient script in the workspace directory. Use command for shell commands. Use script with an interpreter for temporary multi-line code instead of node -e, python -c, heredocs, echo, or redirection.",
       parameters: {
         type: "object",
         properties: {
-          command: { type: "string", description: "Command to execute" },
+          command: { type: "string", description: "Shell command to execute" },
+          shell: {
+            type: "string",
+            enum: ["auto", "powershell", "cmd", "sh"],
+            description: "Shell used for command execution",
+            default: "auto",
+          },
+          script: { type: "string", description: "Temporary script source to run from a file" },
+          interpreter: {
+            type: "string",
+            enum: ["node", "python", "powershell", "sh"],
+            description: "Interpreter for script",
+          },
+          timeoutSeconds: {
+            type: "number",
+            description: "Maximum command or script runtime in seconds",
+          },
         },
-        required: ["command"],
       },
     },
   },
@@ -213,10 +233,68 @@ export const toolDefinitions: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "expand_observation",
+      description: "Fetch exact raw output for a stored tool observation only when the compact summary is insufficient.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Observation id, for example obs_12_abcd1234" },
+          maxChars: { type: "number", description: "Maximum raw characters to return" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "promote_context",
+      description: "Promote a concise durable fact into working memory for future turns.",
+      parameters: {
+        type: "object",
+        properties: {
+          note: { type: "string", description: "Concise fact, decision, file path, or next step to remember" },
+        },
+        required: ["note"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "drop_context",
+      description: "Remove stale or incorrect text from working memory.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string", description: "Exact or approximate working-memory text to remove" },
+        },
+        required: ["text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "summarize_phase",
+      description: "Replace working memory with a concise phase summary after a major task phase completes.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "Concise current state, decisions made, and next action" },
+        },
+        required: ["summary"],
+      },
+    },
+  },
 ];
 
 export class ToolRegistry {
   private handlers: Map<string, ToolHandler["execute"]> = new Map();
+  private shellTimeoutMs = DEFAULT_SHELL_TIMEOUT_MS;
 
   constructor() {
     this.registerDefaults();
@@ -229,7 +307,7 @@ export class ToolRegistry {
     this.handlers.set("glob", globTool);
     this.handlers.set("grep", grepTool);
     this.handlers.set("list_dir", listDirTool);
-    this.handlers.set("shell", shellTool);
+    this.handlers.set("shell", (args, ctx) => shellTool(args, ctx, this.shellTimeoutMs));
     this.handlers.set("git_status", gitStatusTool);
     this.handlers.set("git_diff", gitDiffTool);
     this.handlers.set("git_commit", gitCommitTool);
@@ -238,6 +316,10 @@ export class ToolRegistry {
 
   getDefinitions(): ToolDefinition[] {
     return toolDefinitions;
+  }
+
+  setShellTimeoutMs(timeoutMs: number): void {
+    this.shellTimeoutMs = Math.max(1, timeoutMs);
   }
 
   async execute(
@@ -273,9 +355,16 @@ async function readFileTool(args: Record<string, unknown>, ctx: ToolContext): Pr
   const content = await readFile(filePath, "utf-8");
   const lines = content.split("\n");
   const offset = (args.offset as number) ?? 1;
-  const limit = (args.limit as number) ?? lines.length;
+  const requestedLimit = (args.limit as number) ?? DEFAULT_READ_LIMIT;
+  const limit = Math.min(Math.max(1, requestedLimit), MAX_READ_LIMIT);
   const slice = lines.slice(offset - 1, offset - 1 + limit);
-  return slice.map((line, i) => `${offset + i}|${line}`).join("\n");
+  const rendered = slice.map((line, i) => `${offset + i}|${line}`).join("\n");
+  const end = offset + slice.length - 1;
+  const note =
+    end < lines.length
+      ? `\n[read_file truncated: showing lines ${offset}-${end} of ${lines.length}. Request offset=${end + 1} with a limit to continue.]`
+      : "";
+  return rendered + note;
 }
 
 async function writeFileTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
@@ -356,17 +445,233 @@ async function listDirTool(args: Record<string, unknown>, ctx: ToolContext): Pro
     .join("\n");
 }
 
-async function shellTool(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-  const command = args.command as string;
+async function shellTool(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+  defaultTimeoutMs: number,
+): Promise<string> {
+  const timeoutMs = timeoutMsFromArgs(args, defaultTimeoutMs);
+  const command = typeof args.command === "string" ? args.command : "";
+  const script = typeof args.script === "string" ? args.script : "";
+
+  if (script) {
+    assertSafeShellCommand(script);
+    const interpreter = args.interpreter as ScriptInterpreter | undefined;
+    if (!interpreter) {
+      throw new Error("Shell script execution requires an interpreter");
+    }
+    return runTransientScript(script, interpreter, ctx.cwd, timeoutMs);
+  }
+
+  if (!command) {
+    throw new Error("Shell execution requires command or script");
+  }
+
   assertSafeShellCommand(command);
-  const isWin = process.platform === "win32";
-  const { stdout, stderr } = await execFileAsync(
-    isWin ? "cmd.exe" : "sh",
-    isWin ? ["/c", command] : ["-c", command],
-    { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1024 * 1024 },
+  return runShellCommand(command, (args.shell as ShellMode | undefined) ?? "auto", ctx.cwd, timeoutMs);
+}
+
+type ShellMode = "auto" | "powershell" | "cmd" | "sh";
+type ScriptInterpreter = "node" | "python" | "powershell" | "sh";
+
+async function runShellCommand(
+  command: string,
+  shell: ShellMode,
+  cwd: string,
+  timeoutMs: number,
+): Promise<string> {
+  if (process.platform === "win32") {
+    if (shell === "cmd") {
+      return withTempScript(".cmd", cmdScript(command), false, (file) =>
+        runExecFile("cmd.exe", ["/d", "/s", "/c", quoteWindowsPath(file)], cwd, timeoutMs),
+      );
+    }
+    if (shell === "sh") {
+      return withTempScript(".sh", command, false, (file) =>
+        runExecFile("sh", [file], cwd, timeoutMs),
+      );
+    }
+
+    const runPowerShell = () =>
+      withTempScript(".ps1", powershellScript(command), true, (file) =>
+        runFirstAvailable(
+          [
+            { file: "pwsh", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] },
+            { file: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] },
+          ],
+          cwd,
+          timeoutMs,
+        ),
+      );
+
+    if (shell === "powershell") return runPowerShell();
+    try {
+      return await runPowerShell();
+    } catch (err) {
+      if (!isExecutableMissing(err)) throw err;
+      return withTempScript(".cmd", cmdScript(command), false, (file) =>
+        runExecFile("cmd.exe", ["/d", "/s", "/c", quoteWindowsPath(file)], cwd, timeoutMs),
+      );
+    }
+  }
+
+  if (shell === "powershell") {
+    return withTempScript(".ps1", powershellScript(command), true, (file) =>
+      runFirstAvailable(
+        [
+          { file: "pwsh", args: ["-NoProfile", "-File", file] },
+          { file: "powershell", args: ["-NoProfile", "-File", file] },
+        ],
+        cwd,
+        timeoutMs,
+      ),
+    );
+  }
+
+  return withTempScript(".sh", command, false, (file) =>
+    runExecFile("sh", [file], cwd, timeoutMs),
   );
+}
+
+async function runTransientScript(
+  script: string,
+  interpreter: ScriptInterpreter,
+  cwd: string,
+  timeoutMs: number,
+): Promise<string> {
+  switch (interpreter) {
+    case "node":
+      return withTempScript(".mjs", script, false, (file) =>
+        runExecFile(process.execPath || "node", [file], cwd, timeoutMs),
+      );
+    case "python":
+      return withTempScript(".py", script, false, (file) =>
+        runFirstAvailable(
+          [
+            { file: process.platform === "win32" ? "py" : "python3", args: [file] },
+            { file: "python", args: [file] },
+            { file: "python3", args: [file] },
+          ],
+          cwd,
+          timeoutMs,
+        ),
+      );
+    case "powershell":
+      return withTempScript(".ps1", powershellScript(script), true, (file) =>
+        runFirstAvailable(
+          [
+            { file: "pwsh", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] },
+            { file: "powershell", args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file] },
+          ],
+          cwd,
+          timeoutMs,
+        ),
+      );
+    case "sh":
+      return withTempScript(".sh", script, false, (file) =>
+        runExecFile("sh", [file], cwd, timeoutMs),
+      );
+  }
+}
+
+async function withTempScript(
+  extension: string,
+  content: string,
+  utf8Bom: boolean,
+  run: (file: string) => Promise<string>,
+): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), "nhicode-tool-"));
+  const file = join(dir, `script${extension}`);
+  try {
+    await writeFile(file, utf8Bom ? `\uFEFF${content}` : content, "utf-8");
+    return await run(file);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runFirstAvailable(
+  candidates: Array<{ file: string; args: string[] }>,
+  cwd: string,
+  timeoutMs: number,
+): Promise<string> {
+  let missingError: unknown;
+  for (const candidate of candidates) {
+    try {
+      return await runExecFile(candidate.file, candidate.args, cwd, timeoutMs);
+    } catch (err) {
+      if (!isExecutableMissing(err)) throw err;
+      missingError = err;
+    }
+  }
+  throw missingError ?? new Error("No matching interpreter was found");
+}
+
+async function runExecFile(
+  file: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number,
+): Promise<string> {
+  try {
+    const { stdout, stderr } = await execFileAsync(file, args, {
+      cwd,
+      timeout: timeoutMs,
+      maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
+      windowsHide: true,
+    });
+    return formatCommandOutput(stdout, stderr);
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(`Shell command exceeded the maximum runtime of ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+    throw err;
+  }
+}
+
+function timeoutMsFromArgs(args: Record<string, unknown>, defaultTimeoutMs: number): number {
+  const seconds = args.timeoutSeconds;
+  if (typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0) {
+    return Math.round(seconds * 1000);
+  }
+  return defaultTimeoutMs;
+}
+
+function cmdScript(command: string): string {
+  return `@echo off\r\nchcp 65001 >nul\r\n${command}`;
+}
+
+function powershellScript(command: string): string {
+  return [
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()",
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new()",
+    command,
+  ].join("\r\n");
+}
+
+function quoteWindowsPath(path: string): string {
+  return `"${path.replace(/"/g, '""')}"`;
+}
+
+function formatCommandOutput(stdout: string, stderr: string): string {
   const output = [stdout, stderr].filter(Boolean).join("\n").trim();
   return output || "(no output)";
+}
+
+function isExecutableMissing(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  return code === "ENOENT";
+}
+
+function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const value = err as { killed?: unknown; signal?: unknown; message?: unknown };
+  return (
+    value.killed === true ||
+    value.signal === "SIGTERM" ||
+    (typeof value.message === "string" && value.message.toLowerCase().includes("timed out"))
+  );
 }
 
 async function gitTool(args: string[], ctx: ToolContext): Promise<string> {

@@ -1,4 +1,12 @@
-import type { ApprovalResponse, Project, SessionEvent, ThreadSummary } from "@nhicode/shared";
+import type {
+  ApprovalResponse,
+  ApprovalRule,
+  ObservationRecord,
+  Project,
+  SessionEvent,
+  ThreadSummary,
+  TurnResult,
+} from "@nhicode/shared";
 
 /** Native Tauri app talks to the local API server directly (not via browser proxy). */
 function isTauriApp(): boolean {
@@ -81,6 +89,20 @@ export async function fetchThreads(projectId?: string): Promise<ThreadSummary[]>
   return res.json();
 }
 
+export async function fetchApprovalRules(projectId?: string): Promise<ApprovalRule[]> {
+  const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+  const res = await fetch(`${API}/approval-rules${query}`);
+  return res.json();
+}
+
+export async function deleteApprovalRule(id: string): Promise<void> {
+  const res = await fetch(`${API}/approval-rules/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to delete approval rule");
+  }
+}
+
 export interface StoredMessageDto {
   threadId: string;
   role: string;
@@ -92,11 +114,39 @@ export interface StoredMessageDto {
   createdAt: string;
 }
 
+export interface StoredRunEventDto {
+  id: string;
+  threadId: string;
+  createdAt: string;
+  type: string;
+  status?: string;
+  message?: string;
+  detail?: Record<string, unknown>;
+}
+
 export async function fetchThreadMessages(threadId: string): Promise<StoredMessageDto[]> {
   const res = await fetch(`${API}/threads/${threadId}/messages`);
   if (!res.ok) {
     const err = await res.json();
     throw new Error(err.error ?? "Failed to load messages");
+  }
+  return res.json();
+}
+
+export async function fetchThreadEvents(threadId: string): Promise<StoredRunEventDto[]> {
+  const res = await fetch(`${API}/threads/${threadId}/events`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to load events");
+  }
+  return res.json();
+}
+
+export async function fetchThreadObservations(threadId: string): Promise<ObservationRecord[]> {
+  const res = await fetch(`${API}/threads/${threadId}/observations`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to load observations");
   }
   return res.json();
 }
@@ -107,12 +157,15 @@ export async function createThread(opts: {
   mode?: string;
   model?: string;
   providerId?: string;
+  modelMode?: string;
 }): Promise<{
   id: string;
   cwd: string;
   projectId?: string;
   mode: string;
   model: string;
+  modelMode?: string;
+  providerId?: string;
   status: string;
 }> {
   const res = await fetch(`${API}/threads`, {
@@ -130,7 +183,7 @@ export async function createThread(opts: {
 export async function sendMessage(
   threadId: string,
   message: string,
-): Promise<{ text: string; status: string; error?: string }> {
+): Promise<TurnResult> {
   const res = await fetch(`${API}/threads/${threadId}/message`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -148,6 +201,14 @@ export async function setThreadMode(threadId: string, mode: string): Promise<voi
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
+  });
+}
+
+export async function setThreadModelMode(threadId: string, modelMode?: string): Promise<void> {
+  await fetch(`${API}/threads/${threadId}/model-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ modelMode }),
   });
 }
 

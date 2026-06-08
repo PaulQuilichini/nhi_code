@@ -1,9 +1,12 @@
-import { useState } from "react";
-import { setApiKey, type Config } from "../api";
+import { useEffect, useState } from "react";
+import type { ApprovalRule } from "@nhicode/shared";
+import { CATEGORY_LABEL } from "@nhicode/shared/types";
+import { deleteApprovalRule, fetchApprovalRules, setApiKey, type Config } from "../api";
 
 interface SettingsModalProps {
   config: Config | null;
   providers: string[];
+  activeProjectId?: string;
   onClose: () => void;
   onProvidersChange: (providers: string[]) => void;
 }
@@ -11,11 +14,18 @@ interface SettingsModalProps {
 export function SettingsModal({
   config,
   providers,
+  activeProjectId,
   onClose,
   onProvidersChange,
 }: SettingsModalProps) {
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
+  const [approvalRules, setApprovalRules] = useState<ApprovalRule[]>([]);
+  const [deletingRuleId, setDeletingRuleId] = useState<string | null>(null);
+
+  useEffect(() => {
+    void fetchApprovalRules(activeProjectId).then(setApprovalRules).catch(() => setApprovalRules([]));
+  }, [activeProjectId]);
 
   const handleSaveKey = async (providerId: string) => {
     const key = keys[providerId];
@@ -26,6 +36,16 @@ export function SettingsModal({
       onProvidersChange(updated);
     } finally {
       setSaving(null);
+    }
+  };
+
+  const handleDeleteApprovalRule = async (id: string) => {
+    setDeletingRuleId(id);
+    try {
+      await deleteApprovalRule(id);
+      setApprovalRules((prev) => prev.filter((rule) => rule.id !== id));
+    } finally {
+      setDeletingRuleId(null);
     }
   };
 
@@ -61,6 +81,31 @@ export function SettingsModal({
           ))}
         </div>
 
+        <div className="modal-section">
+          <label>Persistent approvals</label>
+          {approvalRules.length === 0 ? (
+            <div className="settings-empty">No persistent approvals</div>
+          ) : (
+            <div className="approval-rule-list">
+              {approvalRules.map((rule) => (
+                <div key={rule.id} className="approval-rule-row">
+                  <div className="approval-rule-main">
+                    <span className="approval-rule-kind">{approvalRuleLabel(rule)}</span>
+                    <span className="approval-rule-path">{rule.projectPath}</span>
+                  </div>
+                  <button
+                    className="btn btn-outline"
+                    disabled={deletingRuleId === rule.id}
+                    onClick={() => void handleDeleteApprovalRule(rule.id)}
+                  >
+                    {deletingRuleId === rule.id ? "…" : "Delete"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div className="modal-actions">
           <button className="btn btn-primary" onClick={onClose}>
             Done
@@ -69,4 +114,12 @@ export function SettingsModal({
       </div>
     </div>
   );
+}
+
+function approvalRuleLabel(rule: ApprovalRule): string {
+  if (rule.kind === "shell_prefix") return `Shell prefix: ${rule.prefix ?? ""}`;
+  if (rule.kind === "category") {
+    return `Category: ${rule.category ? CATEGORY_LABEL[rule.category] : ""}`;
+  }
+  return `Tool: ${rule.toolName ?? ""}`;
 }

@@ -1,8 +1,19 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import type { SessionEvent, SessionStatus, Project, ThreadSummary, ApprovalResponse } from "@nhicode/shared";
+import type {
+  SessionEvent,
+  SessionStatus,
+  Project,
+  ThreadSummary,
+  ApprovalResponse,
+  TurnResult,
+  ContextDiagnostics,
+} from "@nhicode/shared";
+import { suggestShellPrefix } from "@nhicode/shared/shell";
 import {
   fetchThreads,
   fetchThreadMessages,
+  fetchThreadEvents,
+  fetchThreadObservations,
   fetchBootstrap,
   createThread,
   createProject,
@@ -10,11 +21,13 @@ import {
   deleteProject,
   sendMessage,
   setThreadMode,
+  setThreadModelMode,
   cancelThread,
   respondToApproval,
   connectWebSocket,
   fetchHealth,
   type Config,
+  type StoredRunEventDto,
 } from "./api";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
@@ -50,6 +63,30 @@ type ConnectionStatus = "connecting" | "connected" | "disconnected" | "reconnect
 const RECONNECT_DELAY_MS = 1500;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const STALE_ACTIVITY_MS = 45_000;
+const BOOTSTRAP_RETRIES = 60;
+const BOOTSTRAP_RETRY_DELAY_MS = 500;
+
+function defaultModelMode(providerId?: string, model?: string): string | undefined {
+  const value = `${providerId ?? ""} ${model ?? ""}`.toLocaleLowerCase();
+  return value.includes("deepseek") ? "deepseek-high" : undefined;
+}
+
+function modelModeForRequest(
+  providerId: string,
+  model: string,
+  modelMode: string | undefined,
+): string | undefined {
+  return defaultModelMode(providerId, model) ? modelMode ?? "deepseek-high" : undefined;
+}
+
+function suggestedShellPrefix(args: string): string | undefined {
+  try {
+    const parsed = JSON.parse(args) as { command?: unknown };
+    return typeof parsed.command === "string" ? suggestShellPrefix(parsed.command) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function loadCollapsedProjects(): Set<string> {
   try {
@@ -85,6 +122,93 @@ function updateSubAgentMessage(
   );
 }
 
+function mergeFinalTurnMessages(messages: ChatMessage[], result: TurnResult): ChatMessage[] {
+  const next = closeStreamingMessages(messages);
+  let lastUserIdx = -1;
+  for (let i = next.length - 1; i >= 0; i--) {
+    if (next[i].role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  const assistantTextAfterLastUser = next
+    .slice(lastUserIdx + 1)
+    .filter((m) => m.role === "assistant" && !m.isError)
+    .map((m) => (m.role === "assistant" ? m.content : ""))
+    .join("");
+  const resultText = result.text.trim();
+
+  if (resultText && !assistantTextAfterLastUser) {
+    next.push({
+      id: `rest-result-${Date.now()}`,
+      role: "assistant",
+      content: result.text,
+    });
+  } else if (
+    resultText &&
+    result.text.startsWith(assistantTextAfterLastUser) &&
+    result.text.length > assistantTextAfterLastUser.length
+  ) {
+    const missingText = result.text.slice(assistantTextAfterLastUser.length);
+    if (missingText.trim()) {
+      next.push({
+        id: `rest-result-${Date.now()}`,
+        role: "assistant",
+        content: missingText,
+      });
+    }
+  }
+
+  if (result.status === "error" && result.error) {
+    const last = next[next.length - 1];
+    if (!(last?.role === "assistant" && last.isError && last.content === result.error)) {
+      next.push({
+        id: `error-${Date.now()}`,
+        role: "assistant",
+        content: result.error,
+        isError: true,
+      });
+    }
+  }
+
+  return next;
+}
+
+function turnResultUiStatus(result: TurnResult): SessionStatus {
+  if (result.status === "completed") return "idle";
+  if (result.status === "cancelled") return "cancelled";
+  return "error";
+}
+
+function latestContextDiagnostics(events: StoredRunEventDto[]): ContextDiagnostics | null {
+  const event = [...events].reverse().find((item) => item.type === "context_diagnostics");
+  const detail = event?.detail;
+  if (!event || !detail) return null;
+  return {
+    createdAt: event.createdAt,
+    estimatedInputTokens: numberDetail(detail.estimatedInputTokens),
+    inputBudgetTokens: numberDetail(detail.inputBudgetTokens),
+    maxContextTokens: numberDetail(detail.maxContextTokens),
+    outputReserveTokens: numberDetail(detail.outputReserveTokens),
+    toolReserveTokens: numberDetail(detail.toolReserveTokens),
+    suppressedObservationTokens: numberDetail(detail.suppressedObservationTokens),
+    cacheHitTokens: optionalNumberDetail(detail.cacheHitTokens),
+    cacheMissTokens: optionalNumberDetail(detail.cacheMissTokens),
+    promptTokens: optionalNumberDetail(detail.promptTokens),
+    completionTokens: optionalNumberDetail(detail.completionTokens),
+    totalTokens: optionalNumberDetail(detail.totalTokens),
+    slots: Array.isArray(detail.slots) ? (detail.slots as ContextDiagnostics["slots"]) : [],
+  };
+}
+
+function numberDetail(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function optionalNumberDetail(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
@@ -100,12 +224,14 @@ export default function App() {
   const [mode, setMode] = useState("agent");
   const [model, setModel] = useState("deepseek-v4-pro");
   const [providerId, setProviderId] = useState("deepseek");
+  const [modelMode, setModelMode] = useState<string | undefined>("deepseek-high");
   const [config, setConfig] = useState<Config | null>(null);
   const [providers, setProviders] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [theme, setTheme] = useState<Theme>(() => getStoredTheme());
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [statusNotice, setStatusNotice] = useState<StatusNotice | null>(null);
+  const [contextDiagnostics, setContextDiagnostics] = useState<ContextDiagnostics | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamBufferRef = useRef({ text: "", thinking: "" });
   const lastActivityAtRef = useRef(0);
@@ -116,6 +242,11 @@ export default function App() {
   const sessionStatusRef = useRef<SessionStatus>("idle");
 
   const isBusy = sessionStatus === "running" || sessionStatus === "waiting_approval";
+
+  const setSessionStatusImmediate = useCallback((status: SessionStatus) => {
+    sessionStatusRef.current = status;
+    setSessionStatus(status);
+  }, []);
 
   useEffect(() => {
     sessionStatusRef.current = sessionStatus;
@@ -137,7 +268,8 @@ export default function App() {
 
   useEffect(() => {
     async function boot() {
-      for (let i = 0; i < 10; i++) {
+      let lastError: unknown;
+      for (let i = 0; i < BOOTSTRAP_RETRIES; i++) {
         try {
           const boot = await fetchBootstrap();
           setProviders(boot.providers);
@@ -165,16 +297,23 @@ export default function App() {
             }
           }
           return;
-        } catch {
-          await new Promise((r) => setTimeout(r, 200));
+        } catch (err) {
+          lastError = err;
+          await new Promise((r) => setTimeout(r, BOOTSTRAP_RETRY_DELAY_MS));
         }
       }
+      showNotice(
+        "error",
+        lastError instanceof Error
+          ? `NHI Code API did not become ready: ${lastError.message}`
+          : "NHI Code API did not become ready.",
+      );
     }
     boot();
 
     const savedProjectId = localStorage.getItem("nhicode_active_project");
     if (savedProjectId) setActiveProjectId(savedProjectId);
-  }, []);
+  }, [showNotice]);
 
   useEffect(() => {
     if (sessionStatus !== "running") return;
@@ -204,6 +343,29 @@ export default function App() {
   const updateThreadStatus = useCallback((threadId: string, status: SessionStatus) => {
     setThreads((prev) => prev.map((t) => (t.id === threadId ? { ...t, status } : t)));
   }, []);
+
+  const finalizeTurnResult = useCallback(
+    (threadId: string, result: TurnResult) => {
+      const nextStatus = turnResultUiStatus(result);
+      if (result.contextDiagnostics) setContextDiagnostics(result.contextDiagnostics);
+      setMessages((prev) => mergeFinalTurnMessages(prev, result));
+      setSessionStatusImmediate(nextStatus);
+      updateThreadStatus(threadId, nextStatus);
+
+      if (result.status === "error") {
+        showNotice("error", result.error ?? "The agent stopped due to an error.");
+      } else if (result.status === "cancelled") {
+        showNotice("info", "Stopped — the agent was cancelled.");
+      } else {
+        clearNotice();
+      }
+
+      setActivityLabel("");
+      streamBufferRef.current = { text: "", thinking: "" };
+      void fetchThreads().then(setThreads);
+    },
+    [clearNotice, setSessionStatusImmediate, showNotice, updateThreadStatus],
+  );
 
   const handleStreamEvent = useCallback(
     (event: SessionEvent) => {
@@ -318,11 +480,11 @@ export default function App() {
             prev.map((m) => {
               if (m.role === "subagent" && m.toolCallId === event.result.toolCallId) {
                 clearSubAgentBuffers(event.result.toolCallId);
-                return {
-                  ...m,
-                  result: event.result.content,
-                  status: event.result.isError ? "error" : "done",
-                  items: finalizeSubAgentItems(m.items),
+              return {
+                ...m,
+                result: event.result.content,
+                status: event.result.isError ? "error" : "done",
+                items: finalizeSubAgentItems(m.items),
                 };
               }
               if (m.role !== "tool") return m;
@@ -332,9 +494,16 @@ export default function App() {
                 result: event.result.content,
                 status: event.result.isError ? "error" : "done",
                 isError: event.result.isError,
+                observationId: event.result.observationId,
+                rawContentLength: event.result.rawContentLength,
+                compacted: event.result.compacted,
               };
             }),
           );
+          break;
+
+        case "context_diagnostics":
+          setContextDiagnostics(event.diagnostics);
           break;
 
         case "subagent_spawned":
@@ -389,11 +558,15 @@ export default function App() {
             args: event.call.function.arguments,
             scopes: event.scopes,
             category: (event as any).category ?? "file",
+            suggestedShellPrefix:
+              event.call.function.name === "shell"
+                ? suggestedShellPrefix(event.call.function.arguments)
+                : undefined,
           });
           break;
 
         case "status_changed":
-          setSessionStatus(event.status);
+          setSessionStatusImmediate(event.status);
           if (threadId) updateThreadStatus(threadId, event.status);
           if (event.status === "waiting_approval") {
             setActivityLabel("Waiting for approval");
@@ -403,52 +576,11 @@ export default function App() {
           break;
 
         case "turn_complete":
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.role === "assistant" || m.role === "thinking"
-                ? m.isStreaming
-                  ? { ...m, isStreaming: false }
-                  : m
-                : m,
-            ),
-          );
-          {
-            const result = event.result;
-            const nextStatus: SessionStatus =
-              result.status === "completed"
-                ? "idle"
-                : result.status === "cancelled"
-                  ? "cancelled"
-                  : "error";
-            setSessionStatus(nextStatus);
-            if (threadId) updateThreadStatus(threadId, nextStatus);
-
-            if (result.status === "error") {
-              showNotice("error", result.error ?? "The agent stopped due to an error.");
-              if (result.error) {
-                setMessages((prev) => [
-                  ...prev,
-                  {
-                    id: `error-${Date.now()}`,
-                    role: "assistant",
-                    content: result.error!,
-                    isError: true,
-                  },
-                ]);
-              }
-            } else if (result.status === "cancelled") {
-              showNotice("info", "Stopped — the agent was cancelled.");
-            } else {
-              clearNotice();
-            }
-          }
-          setActivityLabel("");
-          streamBufferRef.current = { text: "", thinking: "" };
-          fetchThreads().then(setThreads);
+          if (threadId) finalizeTurnResult(threadId, event.result);
           break;
 
         case "error":
-          setSessionStatus("error");
+          setSessionStatusImmediate("error");
           if (threadId) updateThreadStatus(threadId, "error");
           setActivityLabel("");
           showNotice("error", event.error);
@@ -468,7 +600,7 @@ export default function App() {
           break;
       }
     },
-    [updateThreadStatus, touchActivity, showNotice, clearNotice],
+    [updateThreadStatus, touchActivity, showNotice, finalizeTurnResult, setSessionStatusImmediate],
   );
 
   const connectWsRef = useRef<(sessionId: string) => void>(() => {});
@@ -479,7 +611,7 @@ export default function App() {
       if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
         const status = sessionStatusRef.current;
         if (status === "running" || status === "waiting_approval") {
-          setSessionStatus("error");
+          setSessionStatusImmediate("error");
           updateThreadStatus(sessionId, "error");
           setActivityLabel("");
           showNotice(
@@ -499,7 +631,7 @@ export default function App() {
         }
       }, RECONNECT_DELAY_MS);
     },
-    [updateThreadStatus, showNotice],
+    [setSessionStatusImmediate, updateThreadStatus, showNotice],
   );
 
   const connectWs = useCallback(
@@ -546,35 +678,45 @@ export default function App() {
     async (id: string) => {
       localStorage.setItem("nhicode_active_thread", id);
       setActiveThreadId(id);
-      setSessionStatus("idle");
+      setSessionStatusImmediate("idle");
       setActivityLabel("");
+      setContextDiagnostics(null);
       clearNotice();
       reconnectAttemptsRef.current = 0;
       streamBufferRef.current = { text: "", thinking: "" };
 
       const thread = threads.find((t) => t.id === id);
       if (thread) {
+        const nextProviderId = thread.providerId ?? providerId;
         setMode(thread.mode);
         setModel(thread.model);
+        setProviderId(nextProviderId);
+        setModelMode(thread.modelMode ?? defaultModelMode(nextProviderId, thread.model));
         if (thread.projectId) {
           setActiveProjectId(thread.projectId);
           localStorage.setItem("nhicode_active_project", thread.projectId);
         }
         if (thread.status !== "running") {
-          setSessionStatus(thread.status);
+          setSessionStatusImmediate(thread.status);
         }
       }
 
       connectWs(id);
 
       try {
-        const stored = await fetchThreadMessages(id);
-        setMessages(storedMessagesToChat(stored));
+        const [stored, observations, events] = await Promise.all([
+          fetchThreadMessages(id),
+          fetchThreadObservations(id),
+          fetchThreadEvents(id),
+        ]);
+        setMessages(storedMessagesToChat(stored, observations));
+        setContextDiagnostics(latestContextDiagnostics(events));
       } catch {
         setMessages([]);
+        setContextDiagnostics(null);
       }
     },
-    [threads, connectWs, clearNotice],
+    [threads, providerId, connectWs, clearNotice, setSessionStatusImmediate],
   );
 
   useEffect(() => {
@@ -663,7 +805,14 @@ export default function App() {
     setActiveProjectId(projectId);
     localStorage.setItem("nhicode_active_project", projectId);
     try {
-      const thread = await createThread({ projectId, mode, model, providerId });
+      const selectedModelMode = modelModeForRequest(providerId, model, modelMode);
+      const thread = await createThread({
+        projectId,
+        mode,
+        model,
+        providerId,
+        modelMode: selectedModelMode,
+      });
       const summary: ThreadSummary = {
         id: thread.id,
         title: "New thread",
@@ -671,7 +820,8 @@ export default function App() {
         projectId: thread.projectId ?? projectId,
         mode: thread.mode,
         model: thread.model,
-        providerId,
+        modelMode: thread.modelMode ?? selectedModelMode,
+        providerId: thread.providerId ?? providerId,
         status: thread.status as ThreadSummary["status"],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
@@ -680,7 +830,8 @@ export default function App() {
       localStorage.setItem("nhicode_active_thread", thread.id);
       setActiveThreadId(thread.id);
       setMessages([]);
-      setSessionStatus("idle");
+      setContextDiagnostics(null);
+      setSessionStatusImmediate("idle");
       setActivityLabel("");
       clearNotice();
       reconnectAttemptsRef.current = 0;
@@ -700,13 +851,23 @@ export default function App() {
     clearNotice();
     setMessages((prev) => [...prev, { id: `user-${Date.now()}`, role: "user", content: text }]);
     streamBufferRef.current = { text: "", thinking: "" };
-    setSessionStatus("running");
+    setSessionStatusImmediate("running");
     setActivityLabel("Working…");
     touchActivity();
     if (activeThreadId) updateThreadStatus(activeThreadId, "running");
 
     try {
-      await sendMessage(activeThreadId, text);
+      const threadId = activeThreadId;
+      const result = await sendMessage(threadId, text);
+      if (
+        activeThreadIdRef.current === threadId &&
+        (sessionStatusRef.current === "running" ||
+          sessionStatusRef.current === "waiting_approval")
+      ) {
+        finalizeTurnResult(threadId, result);
+      } else {
+        updateThreadStatus(threadId, turnResultUiStatus(result));
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setMessages((prev) => [
@@ -718,7 +879,7 @@ export default function App() {
           isError: true,
         },
       ]);
-      setSessionStatus("error");
+      setSessionStatusImmediate("error");
       setActivityLabel("");
       showNotice("error", message);
       if (activeThreadId) updateThreadStatus(activeThreadId, "error");
@@ -732,23 +893,51 @@ export default function App() {
     }
   };
 
+  const handleProviderChange = (newProviderId: string) => {
+    setProviderId(newProviderId);
+    setModelMode(defaultModelMode(newProviderId, model));
+  };
+
+  const handleModelChange = (newModel: string) => {
+    setModel(newModel);
+    setModelMode(defaultModelMode(providerId, newModel));
+  };
+
+  const handleModelModeChange = async (newModelMode: string | undefined) => {
+    setModelMode(newModelMode);
+    if (activeThreadId) {
+      await setThreadModelMode(activeThreadId, newModelMode);
+      setThreads((prev) =>
+        prev.map((thread) =>
+          thread.id === activeThreadId
+            ? { ...thread, modelMode: newModelMode, updatedAt: new Date().toISOString() }
+            : thread,
+        ),
+      );
+    }
+  };
+
   const handleCancel = async () => {
     if (activeThreadId) await cancelThread(activeThreadId);
-    setSessionStatus("idle");
+    setSessionStatusImmediate("idle");
     setActivityLabel("");
     showNotice("info", "Stopped — you cancelled the agent.");
   };
 
-  const handleApproval = async (decision: ApprovalResponse["decision"]) => {
+  const handleApproval = async (
+    decision: ApprovalResponse["decision"],
+    shellPrefix?: string,
+  ) => {
     if (!activeThreadId || !pendingApproval) return;
     await respondToApproval(activeThreadId, {
       requestId: pendingApproval.requestId,
       decision,
       category: pendingApproval.category as any,
+      shellPrefix,
     });
     setPendingApproval(null);
     if (decision !== "deny") {
-      setSessionStatus("running");
+      setSessionStatusImmediate("running");
       setActivityLabel("Working…");
     }
   };
@@ -796,22 +985,26 @@ export default function App() {
         mode={mode}
         model={model}
         providerId={providerId}
+        modelMode={modelMode}
         config={config}
         projectName={activeProject?.name}
         hasActiveThread={!!activeThreadId}
         onSend={handleSend}
         onModeChange={handleModeChange}
-        onModelChange={setModel}
-        onProviderChange={setProviderId}
+        onModelChange={handleModelChange}
+        onProviderChange={handleProviderChange}
+        onModelModeChange={(value) => void handleModelModeChange(value)}
         onCancel={handleCancel}
         onNewThread={handleChatNewThread}
         statusNotice={statusNotice}
         onDismissNotice={clearNotice}
+        contextDiagnostics={contextDiagnostics}
       />
       {showSettings && (
         <SettingsModal
           config={config}
           providers={providers}
+          activeProjectId={activeProjectId ?? undefined}
           onClose={() => setShowSettings(false)}
           onProvidersChange={setProviders}
         />

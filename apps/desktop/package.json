@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "predev": "pnpm build:server",
-    "dev:web": "concurrently \"tsx watch server/index.ts\" \"vite\"",
+    "dev:web": "concurrently -k -n api,web \"tsx watch server/index.ts\" \"vite\"",
     "build:web": "vite build",
     "build:server": "esbuild server/index.ts --bundle --platform=node --format=cjs --packages=bundle --outfile=dist-server/bundle.cjs --banner:js=\"#!/usr/bin/env node\"",
     "build": "pnpm build:web && pnpm build:server && tauri build",

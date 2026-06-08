@@ -1,8 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { createServer } from "node:http";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, dirname, join } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { SessionManager } from "@nhicode/core";
 import type { ApprovalResponse } from "@nhicode/shared";
@@ -11,11 +10,10 @@ const PORT = 3847;
 
 function getProjectRoot(): string {
   if (process.env.NHICODE_ROOT) return process.env.NHICODE_ROOT;
-  const serverDir =
-    typeof __dirname !== "undefined"
-      ? __dirname
-      : dirname(fileURLToPath(import.meta.url));
-  return join(serverDir, "../../..");
+  const cwd = process.cwd();
+  return basename(cwd) === "desktop" && basename(dirname(cwd)) === "apps"
+    ? join(cwd, "../..")
+    : cwd;
 }
 
 async function main(): Promise<void> {
@@ -86,6 +84,20 @@ async function main(): Promise<void> {
     }
   });
 
+  app.get("/api/approval-rules", (req, res) => {
+    const projectId = req.query.projectId as string | undefined;
+    res.json(manager.listApprovalRules(projectId));
+  });
+
+  app.delete("/api/approval-rules/:id", (req, res) => {
+    try {
+      manager.deleteApprovalRule(req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.get("/api/threads", (req, res) => {
     const projectId = req.query.projectId as string | undefined;
     res.json(manager.listThreads(projectId));
@@ -97,16 +109,38 @@ async function main(): Promise<void> {
     res.json(manager.getThreadMessages(req.params.id));
   });
 
+  app.get("/api/threads/:id/events", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    res.json(manager.getThreadEvents(req.params.id));
+  });
+
+  app.get("/api/threads/:id/observations", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    const limit = Number(req.query.limit ?? 200);
+    res.json(manager.listObservations(req.params.id, Number.isFinite(limit) ? limit : 200));
+  });
+
+  app.get("/api/threads/:id/observations/:observationId", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    const observation = manager.getObservation(req.params.id, req.params.observationId);
+    if (!observation) return res.status(404).json({ error: "Observation not found" });
+    res.json(observation);
+  });
+
   app.post("/api/threads", (req, res) => {
     try {
-      const { projectId, cwd, mode, model, providerId } = req.body as {
+      const { projectId, cwd, mode, model, providerId, modelMode } = req.body as {
         projectId?: string;
         cwd?: string;
         mode?: string;
         model?: string;
         providerId?: string;
+        modelMode?: string;
       };
-      const session = manager.createThread({ projectId, cwd, mode, model, providerId });
+      const session = manager.createThread({ projectId, cwd, mode, model, providerId, modelMode });
       const thread = manager.getThread(session.id);
       res.json({
         id: session.id,
@@ -114,6 +148,8 @@ async function main(): Promise<void> {
         projectId: thread?.projectId,
         mode: session.getMode(),
         model: session.getModel(),
+        modelMode: session.getModelMode(),
+        providerId: thread?.providerId,
         status: session.getStatus(),
       });
     } catch (err) {
@@ -153,6 +189,14 @@ async function main(): Promise<void> {
     res.json({ mode: session.getMode() });
   });
 
+  app.post("/api/threads/:id/model-mode", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    const { modelMode } = req.body as { modelMode?: string };
+    manager.setThreadModelMode(req.params.id, modelMode);
+    res.json({ modelMode });
+  });
+
   app.post("/api/threads/:id/cancel", (req, res) => {
     const session = manager.ensureSession(req.params.id);
     if (!session) return res.status(404).json({ error: "Thread not found" });
@@ -168,6 +212,19 @@ async function main(): Promise<void> {
 
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: "/ws" });
+  const handleListenError = (err: NodeJS.ErrnoException): void => {
+    if (err.code === "EADDRINUSE") {
+      console.error(
+        `NHI Code API port ${PORT} is already in use. Stop the existing listener and restart.`,
+      );
+    } else {
+      console.error(err);
+    }
+    process.exit(1);
+  };
+
+  server.on("error", handleListenError);
+  wss.on("error", handleListenError);
 
   wss.on("connection", (ws, req) => {
     const url = new URL(req.url ?? "", `http://127.0.0.1:${PORT}`);

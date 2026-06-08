@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import type { SessionStatus } from "@nhicode/shared";
+import type { ContextDiagnostics, SessionStatus } from "@nhicode/shared";
 import type { ChatMessage, SubAgentMessage, ToolMessage, StatusNotice } from "../chatTypes";
 import { ThinkingBlock } from "./ThinkingBlock";
-import { ToolCallCard } from "./ToolCallCard";
+import { ToolCallCard, ToolCallGroup } from "./ToolCallCard";
 import { SubAgentCard } from "./SubAgentCard";
 import type { Config } from "../api";
 
@@ -17,9 +17,11 @@ interface ChatPanelProps {
   isBusy: boolean;
   statusNotice: StatusNotice | null;
   onDismissNotice: () => void;
+  contextDiagnostics: ContextDiagnostics | null;
   mode: string;
   model: string;
   providerId: string;
+  modelMode?: string;
   config: Config | null;
   projectName?: string;
   hasActiveThread: boolean;
@@ -27,6 +29,7 @@ interface ChatPanelProps {
   onModeChange: (mode: string) => void;
   onModelChange: (model: string) => void;
   onProviderChange: (id: string) => void;
+  onModelModeChange: (mode?: string) => void;
   onCancel: () => void;
   onNewThread: () => void;
 }
@@ -35,6 +38,12 @@ const MODES = [
   { id: "plan", label: "Plan", desc: "Design without changes" },
   { id: "agent", label: "Agent", desc: "Full coding access" },
   { id: "ask", label: "Ask", desc: "Read-only Q&A" },
+];
+
+const DEEPSEEK_MODES = [
+  { id: "deepseek-off", label: "No reasoning" },
+  { id: "deepseek-high", label: "High reasoning" },
+  { id: "deepseek-max", label: "Maximum reasoning" },
 ];
 
 type RenderBlock =
@@ -84,9 +93,11 @@ export function ChatPanel({
   isBusy,
   statusNotice,
   onDismissNotice,
+  contextDiagnostics,
   mode,
   model,
   providerId,
+  modelMode,
   config,
   projectName,
   hasActiveThread,
@@ -94,6 +105,7 @@ export function ChatPanel({
   onModeChange,
   onModelChange,
   onProviderChange,
+  onModelModeChange,
   onCancel,
   onNewThread,
 }: ChatPanelProps) {
@@ -120,6 +132,7 @@ export function ChatPanel({
 
   const modelOptions = config?.providers ?? [];
   const blocks = groupMessages(messages, isBusy);
+  const showModelMode = isDeepSeekSelection(providerId, model);
   const showDisconnected =
     connectionStatus === "disconnected" || connectionStatus === "reconnecting";
   const statusText =
@@ -151,6 +164,7 @@ export function ChatPanel({
             const [pid, mid] = e.target.value.split(":");
             onProviderChange(pid);
             onModelChange(mid);
+            onModelModeChange(isDeepSeekSelection(pid, mid) ? "deepseek-high" : undefined);
           }}
         >
           {modelOptions.map((p) => (
@@ -161,6 +175,20 @@ export function ChatPanel({
             <option value="deepseek:deepseek-v4-pro">deepseek / deepseek-v4-pro</option>
           )}
         </select>
+
+        {showModelMode && (
+          <select
+            className="model-mode-select"
+            value={modelMode ?? "deepseek-high"}
+            onChange={(e) => onModelModeChange(e.target.value)}
+          >
+            {DEEPSEEK_MODES.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       {hasActiveThread && (
@@ -172,6 +200,10 @@ export function ChatPanel({
             <span className="status-badge status-badge-error">Error</span>
           )}
         </div>
+      )}
+
+      {hasActiveThread && contextDiagnostics && (
+        <ContextDiagnosticsBar diagnostics={contextDiagnostics} />
       )}
 
       {hasActiveThread && statusNotice && (
@@ -323,9 +355,11 @@ function AgentTurn({
 
       {tools.length > 0 && (
         <div className="tool-stack">
-          {tools.map((tool) => (
-            <ToolCallCard key={tool.id} tool={tool} />
-          ))}
+          {tools.length >= 4 ? (
+            <ToolCallGroup tools={tools} />
+          ) : (
+            tools.map((tool) => <ToolCallCard key={tool.id} tool={tool} />)
+          )}
         </div>
       )}
 
@@ -355,4 +389,52 @@ function AgentTurn({
       )}
     </div>
   );
+}
+
+function ContextDiagnosticsBar({ diagnostics }: { diagnostics: ContextDiagnostics }) {
+  const prompt = diagnostics.promptTokens ?? diagnostics.estimatedInputTokens;
+  const cacheHit = diagnostics.cacheHitTokens ?? 0;
+  const cacheMiss = diagnostics.cacheMissTokens ?? 0;
+  return (
+    <details className="context-diagnostics">
+      <summary>
+        <span>Context {formatNumber(prompt)} / {formatNumber(diagnostics.inputBudgetTokens)}</span>
+        {diagnostics.promptTokens !== undefined && (
+          <span>Prompt {formatNumber(diagnostics.promptTokens)}</span>
+        )}
+        {(cacheHit > 0 || cacheMiss > 0) && (
+          <span>Cache {formatNumber(cacheHit)} hit / {formatNumber(cacheMiss)} miss</span>
+        )}
+        {diagnostics.suppressedObservationTokens > 0 && (
+          <span>{formatNumber(diagnostics.suppressedObservationTokens)} obs tokens suppressed</span>
+        )}
+      </summary>
+      <div className="context-diagnostics-body">
+        {diagnostics.slots.map((slot) => (
+          <div key={slot.name} className="context-slot-row">
+            <span>{slot.name.replace(/_/g, " ")}</span>
+            <span>
+              {formatNumber(slot.tokens)}
+              {slot.budgetTokens ? ` / ${formatNumber(slot.budgetTokens)}` : ""}
+              {slot.truncated ? " truncated" : ""}
+            </span>
+          </div>
+        ))}
+        {diagnostics.completionTokens !== undefined && (
+          <div className="context-slot-row">
+            <span>completion</span>
+            <span>{formatNumber(diagnostics.completionTokens)}</span>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat().format(Math.round(value));
+}
+
+function isDeepSeekSelection(providerId: string, model: string): boolean {
+  return `${providerId} ${model}`.toLocaleLowerCase().includes("deepseek");
 }

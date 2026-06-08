@@ -9,8 +9,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
-            let child = spawn_api_server(app.handle())?;
-            app.manage(ApiServer(Mutex::new(Some(child))));
+            let child = if cfg!(debug_assertions) {
+                None
+            } else {
+                Some(spawn_api_server(app.handle())?)
+            };
+            app.manage(ApiServer(Mutex::new(child)));
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -33,42 +37,19 @@ fn spawn_api_server(app: &tauri::AppHandle) -> Result<Child, String> {
     let node = find_node_executable()?;
     let (desktop_dir, repo_root) = resolve_paths(app)?;
 
-    let mut cmd = if cfg!(debug_assertions) {
-        // Development: run TypeScript server with tsx
-        let tsx = desktop_dir
-            .join("node_modules")
-            .join("tsx")
-            .join("dist")
-            .join("cli.mjs");
-        let server_entry = desktop_dir.join("server").join("index.ts");
+    let bundle = app
+        .path()
+        .resource_dir()
+        .map_err(|e| e.to_string())?
+        .join("server")
+        .join("bundle.cjs");
 
-        if !tsx.exists() {
-            return Err(format!(
-                "tsx not found at {}. Run pnpm install in the project root.",
-                tsx.display()
-            ));
-        }
+    if !bundle.exists() {
+        return Err(format!("Server bundle not found at {}", bundle.display()));
+    }
 
-        let mut c = Command::new(&node);
-        c.arg(&tsx).arg(&server_entry);
-        c
-    } else {
-        // Production: bundled server script
-        let bundle = app
-            .path()
-            .resource_dir()
-            .map_err(|e| e.to_string())?
-            .join("server")
-            .join("bundle.cjs");
-
-        if !bundle.exists() {
-            return Err(format!("Server bundle not found at {}", bundle.display()));
-        }
-
-        let mut c = Command::new(&node);
-        c.arg(&bundle);
-        c
-    };
+    let mut cmd = Command::new(&node);
+    cmd.arg(&bundle);
 
     cmd.current_dir(&desktop_dir)
         .env("NHICODE_ROOT", &repo_root)

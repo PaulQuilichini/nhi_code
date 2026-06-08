@@ -6,6 +6,8 @@ import type {
   ModelCapabilities,
   ModelInfo,
   ModelProviderConfig,
+  TokenUsage,
+  TurnStopReason,
   ToolCall,
 } from "@nhicode/shared";
 import { sanitizeMessageHistory } from "@nhicode/context";
@@ -13,6 +15,7 @@ import { sanitizeMessageHistory } from "@nhicode/context";
 export interface ModelProvider {
   id: string;
   listModels(): Promise<ModelInfo[]>;
+  getModelInfo(model?: string): ModelInfo;
   chat(request: ChatRequest): AsyncIterable<ChatEvent>;
   estimateTokens(messages: Message[]): Promise<number>;
   capabilities: ModelCapabilities;
@@ -62,6 +65,9 @@ const KNOWN_MODELS: Record<string, Partial<ModelInfo>> = {
     capabilities: { toolCalling: true, thinking: true, streaming: true },
   },
 };
+
+const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 1_800_000;
 
 export class OpenAICompatibleProvider implements ModelProvider {
   readonly id: string;
@@ -116,15 +122,48 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
   }
 
+  getModelInfo(model = this.defaultModel): ModelInfo {
+    const known = KNOWN_MODELS[model];
+    return {
+      id: model,
+      name: known?.name ?? model,
+      provider: this.providerLabel,
+      maxContext: known?.maxContext ?? 128_000,
+      maxOutput: known?.maxOutput ?? 16_000,
+      capabilities: known?.capabilities ?? this.capabilities,
+    };
+  }
+
   async *chat(request: ChatRequest): AsyncIterable<ChatEvent> {
     const model = request.model || this.defaultModel;
+    const generationConfig = {
+      ...this.generationConfig,
+      ...(request.generationConfig ?? {}),
+    };
+    const deepSeekThinking = isDeepSeekThinkingMode(
+      this.providerLabel,
+      model,
+      generationConfig,
+    );
     const [system, dialog] = splitSystemMessages(request.messages);
     const openaiMessages = [
-      ...system.map(toOpenAIMessage),
-      ...sanitizeMessageHistory(dialog).map(toOpenAIMessage),
+      ...system.map((msg) => toOpenAIMessage(msg, { deepSeekThinking })),
+      ...sanitizeMessageHistory(dialog).map((msg) =>
+        toOpenAIMessage(msg, { deepSeekThinking }),
+      ),
     ];
+    const idleTimeoutMs =
+      request.idleTimeoutMs ??
+      numberConfig(generationConfig, ["model_idle_timeout_ms", "idle_timeout_ms"]) ??
+      DEFAULT_IDLE_TIMEOUT_MS;
+    const requestTimeoutMs =
+      request.requestTimeoutMs ??
+      numberConfig(generationConfig, ["model_request_timeout_ms", "request_timeout_ms"]) ??
+      DEFAULT_REQUEST_TIMEOUT_MS;
+    const abort = createTimeoutAbort(request.signal, idleTimeoutMs, requestTimeoutMs);
 
     try {
+      abort.start();
       const stream = await this.client.chat.completions.create(
         buildStreamParams({
           model,
@@ -132,17 +171,22 @@ export class OpenAICompatibleProvider implements ModelProvider {
           tools: request.tools as OpenAI.ChatCompletionTool[] | undefined,
           temperature: request.temperature,
           maxTokens: request.maxTokens,
-          generationConfig: this.generationConfig,
+          generationConfig,
+          providerLabel: this.providerLabel,
         }),
-        { signal: request.signal },
+        { signal: abort.signal },
       );
 
       let fullContent = "";
       let fullThinking = "";
       const toolCalls: Map<number, { id: string; name: string; arguments: string }> = new Map();
-      let doneEmitted = false;
+      let finishedMessage: Message | null = null;
+      let finishReason: string | undefined;
+      let latestUsage: TokenUsage | undefined;
 
       for await (const chunk of stream) {
+        abort.touch();
+        latestUsage = usageFromChunk(chunk.usage, latestUsage);
         const choice = chunk.choices[0];
         if (!choice) continue;
 
@@ -187,8 +231,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
           }
         }
 
-        if (choice.finish_reason && !doneEmitted) {
-          doneEmitted = true;
+        if (choice.finish_reason && !finishedMessage) {
           const messageToolCalls: ToolCall[] = Array.from(toolCalls.entries())
             .sort(([a], [b]) => a - b)
             .map(([, tc]) => ({
@@ -204,26 +247,42 @@ export class OpenAICompatibleProvider implements ModelProvider {
               fullThinking && messageToolCalls.length > 0 ? fullThinking : undefined,
             tool_calls: messageToolCalls.length > 0 ? messageToolCalls : undefined,
           };
-
-          yield {
-            type: "done",
-            message,
-            usage: chunk.usage
-              ? {
-                  promptTokens: chunk.usage.prompt_tokens ?? 0,
-                  completionTokens: chunk.usage.completion_tokens ?? 0,
-                  totalTokens: chunk.usage.total_tokens ?? 0,
-                }
-              : undefined,
-          };
+          finishedMessage = message;
+          finishReason = choice.finish_reason;
         }
       }
+
+      if (finishedMessage) {
+        yield {
+          type: "done",
+          message: finishedMessage,
+          finishReason,
+          usage: latestUsage,
+        };
+      } else {
+        yield {
+          type: "error",
+          reason: "stream_incomplete",
+          error: "Model stream ended before the provider sent a finish reason.",
+        };
+      }
     } catch (err) {
-      if (request.signal?.aborted) {
-        yield { type: "error", error: "Request cancelled" };
+      const timeout = abort.getTimeout();
+      if (timeout) {
+        yield { type: "error", reason: timeout.reason, error: timeout.message };
         return;
       }
-      yield { type: "error", error: err instanceof Error ? err.message : String(err) };
+      if (request.signal?.aborted) {
+        yield { type: "error", reason: "cancelled", error: "Request cancelled" };
+        return;
+      }
+      yield {
+        type: "error",
+        reason: "provider_error",
+        error: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      abort.dispose();
     }
   }
 
@@ -251,6 +310,47 @@ function appendStreamDelta(
   return { next: buffer + chunk, increment: chunk };
 }
 
+function usageFromChunk(usage: unknown, previous?: TokenUsage): TokenUsage | undefined {
+  if (!usage || typeof usage !== "object") return previous;
+  const value = usage as Record<string, unknown>;
+  const promptTokens = numberField(value.prompt_tokens) ?? previous?.promptTokens ?? 0;
+  const completionTokens =
+    numberField(value.completion_tokens) ?? previous?.completionTokens ?? 0;
+  const totalTokens = numberField(value.total_tokens) ?? previous?.totalTokens ?? 0;
+  const promptDetails = objectField(value.prompt_tokens_details);
+  const completionDetails = objectField(value.completion_tokens_details);
+
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    cachedTokens:
+      numberField(promptDetails?.cached_tokens) ??
+      numberField(value.cached_tokens) ??
+      previous?.cachedTokens,
+    promptCacheHitTokens:
+      numberField(value.prompt_cache_hit_tokens) ??
+      numberField(promptDetails?.cached_tokens) ??
+      previous?.promptCacheHitTokens,
+    promptCacheMissTokens:
+      numberField(value.prompt_cache_miss_tokens) ?? previous?.promptCacheMissTokens,
+    reasoningTokens:
+      numberField(completionDetails?.reasoning_tokens) ??
+      numberField(value.reasoning_tokens) ??
+      previous?.reasoningTokens,
+  };
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function objectField(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
 function buildStreamParams(opts: {
   model: string;
   messages: OpenAI.ChatCompletionMessageParam[];
@@ -258,14 +358,27 @@ function buildStreamParams(opts: {
   temperature?: number;
   maxTokens?: number;
   generationConfig: Record<string, unknown>;
+  providerLabel: string;
 }): OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming {
-  const { thinking, reasoning_effort, enable_thinking, ...rest } = opts.generationConfig;
+  const deepSeekThinking = isDeepSeekThinkingMode(
+    opts.providerLabel,
+    opts.model,
+    opts.generationConfig,
+  );
+  const generationConfig = deepSeekThinking
+    ? stripDeepSeekThinkingSampling(opts.generationConfig)
+    : opts.generationConfig;
+  const { thinking, reasoning_effort, enable_thinking, ...rest } =
+    stripProviderRuntimeConfig(generationConfig);
 
   return {
     model: opts.model,
     messages: opts.messages,
     stream: true,
-    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+    stream_options: { include_usage: true },
+    ...(!deepSeekThinking && opts.temperature !== undefined
+      ? { temperature: opts.temperature }
+      : {}),
     ...(opts.tools?.length ? { tools: opts.tools } : {}),
     ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
     ...rest,
@@ -273,6 +386,96 @@ function buildStreamParams(opts: {
     ...(thinking !== undefined ? { thinking } : {}),
     ...(enable_thinking !== undefined ? { enable_thinking } : {}),
   } as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+}
+
+function stripProviderRuntimeConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...config };
+  delete result.idle_timeout_ms;
+  delete result.request_timeout_ms;
+  delete result.model_idle_timeout_ms;
+  delete result.model_request_timeout_ms;
+  return result;
+}
+
+function stripDeepSeekThinkingSampling(config: Record<string, unknown>): Record<string, unknown> {
+  const result = { ...config };
+  delete result.temperature;
+  delete result.top_p;
+  delete result.frequency_penalty;
+  delete result.presence_penalty;
+  return result;
+}
+
+function numberConfig(config: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = config[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  }
+  return undefined;
+}
+
+function createTimeoutAbort(
+  upstream: AbortSignal | undefined,
+  idleTimeoutMs: number,
+  requestTimeoutMs: number,
+) {
+  const controller = new AbortController();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let requestTimer: ReturnType<typeof setTimeout> | undefined;
+  let timeout:
+    | { reason: Extract<TurnStopReason, "model_timeout">; message: string }
+    | undefined;
+
+  const abortFromUpstream = () => {
+    if (!controller.signal.aborted) controller.abort();
+  };
+
+  const clearIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = undefined;
+  };
+
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => {
+      timeout = {
+        reason: "model_timeout",
+        message: `Model stream was idle for ${Math.round(idleTimeoutMs / 1000)} seconds.`,
+      };
+      controller.abort();
+    }, idleTimeoutMs);
+  };
+
+  return {
+    signal: controller.signal,
+    start() {
+      if (upstream?.aborted) {
+        abortFromUpstream();
+        return;
+      }
+      upstream?.addEventListener("abort", abortFromUpstream, { once: true });
+      requestTimer = setTimeout(() => {
+        timeout = {
+          reason: "model_timeout",
+          message: `Model request exceeded ${Math.round(requestTimeoutMs / 1000)} seconds.`,
+        };
+        controller.abort();
+      }, requestTimeoutMs);
+      armIdle();
+    },
+    touch() {
+      if (!controller.signal.aborted) armIdle();
+    },
+    getTimeout() {
+      return timeout;
+    },
+    dispose() {
+      clearIdle();
+      if (requestTimer) clearTimeout(requestTimer);
+      requestTimer = undefined;
+      upstream?.removeEventListener("abort", abortFromUpstream);
+    },
+  };
 }
 
 function splitSystemMessages(messages: Message[]): [Message[], Message[]] {
@@ -285,8 +488,11 @@ function splitSystemMessages(messages: Message[]): [Message[], Message[]] {
   return [system, rest];
 }
 
-function toOpenAIMessage(msg: Message): OpenAI.ChatCompletionMessageParam {
-  const reasoning = msg.reasoning_content
+function toOpenAIMessage(
+  msg: Message,
+  opts: { deepSeekThinking?: boolean } = {},
+): OpenAI.ChatCompletionMessageParam {
+  const reasoning = shouldSendReasoningContent(msg, opts.deepSeekThinking)
     ? { reasoning_content: msg.reasoning_content }
     : {};
   switch (msg.role) {
@@ -298,7 +504,7 @@ function toOpenAIMessage(msg: Message): OpenAI.ChatCompletionMessageParam {
       if (msg.tool_calls?.length) {
         return {
           role: "assistant",
-          content: msg.content ?? null,
+          content: opts.deepSeekThinking ? msg.content ?? "" : msg.content ?? null,
           ...reasoning,
           tool_calls: msg.tool_calls.map((tc) => ({
             id: tc.id,
@@ -320,6 +526,36 @@ function toOpenAIMessage(msg: Message): OpenAI.ChatCompletionMessageParam {
         ...(msg.name ? { name: msg.name } : {}),
       };
   }
+}
+
+function shouldSendReasoningContent(
+  msg: Message,
+  deepSeekThinking?: boolean,
+): msg is Message & { reasoning_content: string } {
+  if (!msg.reasoning_content) return false;
+  if (!deepSeekThinking) return true;
+  return msg.role === "assistant" && Boolean(msg.tool_calls?.length);
+}
+
+function isDeepSeekThinkingMode(
+  providerLabel: string,
+  model: string,
+  generationConfig: Record<string, unknown>,
+): boolean {
+  if (!isDeepSeekModel(providerLabel, model)) return false;
+  const thinking = generationConfig.thinking;
+  if (thinking === true) return true;
+  if (thinking && typeof thinking === "object" && !Array.isArray(thinking)) {
+    const type = (thinking as Record<string, unknown>).type;
+    return type !== "disabled";
+  }
+  return typeof generationConfig.reasoning_effort === "string";
+}
+
+function isDeepSeekModel(providerLabel: string, model: string): boolean {
+  const provider = providerLabel.toLowerCase();
+  const modelId = model.toLowerCase();
+  return provider.includes("deepseek") || modelId.startsWith("deepseek-");
 }
 
 function matchesProviderModel(providerLabel: string, modelId: string): boolean {

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import type { SubAgentMessage, ToolMessage } from "../chatTypes";
 import { ThinkingBlock } from "./ThinkingBlock";
-import { ToolCallCard } from "./ToolCallCard";
+import { ToolCallCard, ToolCallGroup } from "./ToolCallCard";
 import { SUBAGENT_PROFILE_LABEL } from "../utils/subagentStream";
 
 interface SubAgentCardProps {
@@ -67,9 +67,11 @@ export function SubAgentCard({ subagent }: SubAgentCardProps) {
 
           {tools.length > 0 && (
             <div className="tool-stack subagent-nested-tools">
-              {tools.map((tool) => (
-                <ToolCallCard key={tool.id} tool={tool} />
-              ))}
+              {tools.length >= 4 ? (
+                <ToolCallGroup tools={tools} />
+              ) : (
+                tools.map((tool) => <ToolCallCard key={tool.id} tool={tool} />)
+              )}
             </div>
           )}
 

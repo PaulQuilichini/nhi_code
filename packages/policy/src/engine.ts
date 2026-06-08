@@ -1,4 +1,5 @@
 import type {
+  ApprovalRule,
   ApprovalCategory,
   ApprovalPolicy,
   ApprovalScope,
@@ -7,7 +8,7 @@ import type {
   PolicyRule,
   ToolCall,
 } from "@nhicode/shared";
-import { TOOL_CATEGORY } from "@nhicode/shared";
+import { shellPrefixMatches, TOOL_CATEGORY } from "@nhicode/shared";
 
 export const MODE_PROFILES: Record<string, ModeProfile> = {
   plan: {
@@ -63,8 +64,6 @@ Do NOT make changes. When the plan is ready, tell the user to switch to Agent mo
 };
 
 const WRITE_TOOLS = new Set(["write_file", "edit_file", "shell", "git_commit", "spawn_subagent"]);
-const NETWORK_TOOLS = new Set(["shell"]);
-
 export interface PolicyContext {
   cwd: string;
   targetPath?: string;
@@ -74,16 +73,18 @@ export interface PolicyContext {
 export class PolicyEngine {
   private mode: ModeProfile;
   private rules: PolicyRule[] = [];
+  private approvalRules: ApprovalRule[] = [];
   private sessionApprovals = new Set<string>();
   private projectApprovals = new Set<string>();
   private sessionCategoryApprovals = new Set<ApprovalCategory>();
   private projectCategoryApprovals = new Set<ApprovalCategory>();
   private approvalPolicy: ApprovalPolicy;
 
-  constructor(modeName = "agent", rules: PolicyRule[] = []) {
+  constructor(modeName = "agent", rules: PolicyRule[] = [], approvalRules: ApprovalRule[] = []) {
     this.mode = MODE_PROFILES[modeName] ?? MODE_PROFILES.agent;
     this.approvalPolicy = this.mode.approval;
     this.rules = rules;
+    this.approvalRules = approvalRules;
   }
 
   setMode(modeName: string): void {
@@ -97,6 +98,15 @@ export class PolicyEngine {
 
   addRule(rule: PolicyRule): void {
     this.rules.push(rule);
+  }
+
+  setApprovalRules(rules: ApprovalRule[]): void {
+    this.approvalRules = [...rules];
+  }
+
+  addApprovalRule(rule: ApprovalRule): void {
+    this.approvalRules = this.approvalRules.filter((r) => r.id !== rule.id);
+    this.approvalRules.push(rule);
   }
 
   approveSession(toolName: string): void {
@@ -166,6 +176,9 @@ export class PolicyEngine {
     const sandboxDecision = this.checkSandbox(toolName, args, context);
     if (sandboxDecision) return sandboxDecision;
 
+    const persistedApproval = this.evaluatePersistedApproval(toolName, args, context);
+    if (persistedApproval) return persistedApproval;
+
     // Category-level approvals (check before specific tool approvals — broader scope)
     const category = TOOL_CATEGORY[toolName];
     if (category && (this.sessionCategoryApprovals.has(category) || this.projectCategoryApprovals.has(category))) {
@@ -224,17 +237,29 @@ export class PolicyEngine {
       }
     }
 
-    if (toolName === "shell") {
-      const cmd = (args.command as string) ?? "";
-      if (this.isNetworkCommand(cmd)) {
-        return { action: "ask", scopes: ["once", "session"] };
+    return null;
+  }
+
+  private evaluatePersistedApproval(
+    toolName: string,
+    args: Record<string, unknown>,
+    context: PolicyContext,
+  ): PolicyDecision | null {
+    const category = TOOL_CATEGORY[toolName];
+    for (const rule of this.approvalRules) {
+      if (rule.kind === "tool" && rule.toolName === toolName) {
+        return { action: "allow" };
+      }
+      if (rule.kind === "category" && category && rule.category === category) {
+        return { action: "allow" };
+      }
+      if (rule.kind === "shell_prefix" && toolName === "shell" && rule.prefix) {
+        const command = (args.command as string) ?? context.shellCommand ?? "";
+        if (command && shellPrefixMatches(command, rule.prefix, platformKind())) {
+          return { action: "allow" };
+        }
       }
     }
-
-    if (NETWORK_TOOLS.has(toolName)) {
-      return { action: "ask", scopes: ["once", "session"] };
-    }
-
     return null;
   }
 
@@ -270,6 +295,10 @@ function matchesGlob(path: string, pattern: string): boolean {
 function matchesPattern(value: string, pattern: string): boolean {
   const regex = new RegExp("^" + pattern.replace(/\*/g, ".*").replace(/\./g, "\\.") + "$", "i");
   return regex.test(value);
+}
+
+function platformKind(): "win32" | "posix" {
+  return process.platform === "win32" ? "win32" : "posix";
 }
 
 export { MODE_PROFILES as modeProfiles };

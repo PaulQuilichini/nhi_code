@@ -6,10 +6,17 @@ import type { OpenAICompatibleProvider } from "@nhicode/models";
 import { createProvidersFromConfig } from "@nhicode/models";
 import { PolicyEngine } from "@nhicode/policy";
 import { ToolRegistry } from "@nhicode/tools";
-import { ContextBuilder, AGENT_PROFILES, sanitizeMessageHistory } from "@nhicode/context";
+import {
+  ContextBuilder,
+  AGENT_PROFILES,
+  buildThreadMemory,
+  sanitizeMessageHistory,
+} from "@nhicode/context";
 import { loadConfig, resolveApiKey } from "@nhicode/shared";
 import type {
+  ApprovalRule,
   ApprovalResponse,
+  ObservationRecord,
   Message,
   Project,
   SessionConfig,
@@ -20,9 +27,10 @@ import type {
   Unsubscribe,
 } from "@nhicode/shared";
 import { Session } from "./session.js";
+import type { AgentEngineOptions, PersistApprovalInput } from "./session.js";
 import { JsonStore } from "./store.js";
 import { ApiKeyStore } from "./keys.js";
-import type { StoredMessage } from "./store.js";
+import type { StoredMessage, StoredRunEvent } from "./store.js";
 
 export interface SessionManagerOptions {
   dataDir?: string;
@@ -50,6 +58,9 @@ export class SessionManager {
 
   async initialize(cwd?: string): Promise<void> {
     this.config = await loadConfig(cwd);
+    this.tools.setShellTimeoutMs(
+      secondsToMs(this.config.agents?.shell_timeout_seconds ?? 1800),
+    );
     this.rebuildProviders();
   }
 
@@ -114,6 +125,17 @@ export class SessionManager {
     }
   }
 
+  listApprovalRules(projectId?: string): ApprovalRule[] {
+    const projectPath = projectId ? this.store.getProject(projectId)?.path : undefined;
+    return this.store.listApprovalRules(projectPath);
+  }
+
+  deleteApprovalRule(id: string): void {
+    if (!this.store.deleteApprovalRule(id)) {
+      throw new Error(`Approval rule '${id}' not found`);
+    }
+  }
+
   getThread(id: string): ThreadSummary | undefined {
     return this.store.getThread(id);
   }
@@ -142,6 +164,7 @@ export class SessionManager {
     mode?: string;
     model?: string;
     providerId?: string;
+    modelMode?: string;
     parentId?: string;
     agentProfile?: string;
   }): Session {
@@ -179,18 +202,24 @@ export class SessionManager {
       this.config.default?.model ??
       this.config.providers.find((p) => p.id === providerId)?.default_model ??
       "deepseek-v4-pro";
+    const modelMode = options.modelMode ?? defaultModelMode(providerId, model);
+    const approvalProjectPath = projectId
+      ? this.store.getProject(projectId)?.path ?? cwd
+      : cwd;
 
     const config: SessionConfig = {
       id: randomUUID(),
       cwd,
       mode,
       model,
+      modelMode,
       providerId,
       parentId: options.parentId,
       agentProfile: options.agentProfile,
     };
 
     const policy = new PolicyEngine(mode);
+    policy.setApprovalRules(this.store.listApprovalRules(approvalProjectPath));
     const context = new ContextBuilder();
 
     let maxTurns = 30;
@@ -215,12 +244,7 @@ export class SessionManager {
       policy,
       this.tools,
       context,
-      {
-        maxTurns,
-        maxDepth,
-        onSpawnSubAgent: (parentId, subConfig) =>
-          Promise.resolve(this.createSubAgent(parentId, subConfig, providerId, model)),
-      },
+      this.buildSessionOptions(providerId, model, maxTurns, maxDepth, approvalProjectPath),
       options.parentId ? 1 : 0,
     );
 
@@ -235,6 +259,7 @@ export class SessionManager {
       projectId: options.parentId ? undefined : projectId,
       mode,
       model,
+      modelMode,
       providerId,
       status: "idle",
       parentId: options.parentId,
@@ -264,6 +289,7 @@ export class SessionManager {
       projectId: parentThread?.projectId,
       mode: profile?.mode ?? "agent",
       model: subConfig.model ?? (subConfig.inheritModel !== false ? model : undefined),
+      modelMode: parent.getModelMode(),
       providerId,
       parentId,
       agentProfile: subConfig.profile,
@@ -286,6 +312,10 @@ export class SessionManager {
     }
 
     const policy = new PolicyEngine(thread.mode);
+    const approvalProjectPath = thread.projectId
+      ? this.store.getProject(thread.projectId)?.path ?? thread.cwd
+      : thread.cwd;
+    policy.setApprovalRules(this.store.listApprovalRules(approvalProjectPath));
     const context = new ContextBuilder();
     const maxTurns = 30;
     const maxDepth = this.config.agents?.max_depth ?? 1;
@@ -295,6 +325,7 @@ export class SessionManager {
       cwd: thread.cwd,
       mode: thread.mode,
       model: thread.model,
+      modelMode: thread.modelMode ?? defaultModelMode(providerId, thread.model),
       providerId,
       parentId: thread.parentId,
     };
@@ -305,12 +336,7 @@ export class SessionManager {
       policy,
       this.tools,
       context,
-      {
-        maxTurns,
-        maxDepth,
-        onSpawnSubAgent: (parentId, subConfig) =>
-          Promise.resolve(this.createSubAgent(parentId, subConfig, providerId, thread.model)),
-      },
+      this.buildSessionOptions(providerId, thread.model, maxTurns, maxDepth, approvalProjectPath),
       thread.parentId ? 1 : 0,
     );
 
@@ -321,6 +347,7 @@ export class SessionManager {
         thread.title !== "New thread" ? thread.title : undefined,
       );
     }
+    session.restoreMemory(this.store.getThreadMemory(thread.id)?.content);
 
     session.on((event) => this.handleSessionEvent(thread.id, event));
     this.sessions.set(thread.id, session);
@@ -331,11 +358,75 @@ export class SessionManager {
     this.ensureSession(sessionId)?.respondToApproval(response);
   }
 
+  setThreadModelMode(threadId: string, modelMode?: string): void {
+    this.sessions.get(threadId)?.setModelMode(modelMode);
+    this.store.updateThread(threadId, {
+      modelMode: modelMode || undefined,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  getThreadEvents(threadId: string): StoredRunEvent[] {
+    return this.store.listRunEvents(threadId);
+  }
+
+  listObservations(threadId: string, limit?: number): ObservationRecord[] {
+    return this.store.listObservations(threadId, limit);
+  }
+
+  getObservation(threadId: string, id: string): ObservationRecord | undefined {
+    return this.store.getObservation(threadId, id);
+  }
+
+  private buildSessionOptions(
+    providerId: string,
+    model: string,
+    maxTurns: number,
+    maxDepth: number,
+    approvalProjectPath: string,
+  ): AgentEngineOptions {
+    return {
+      maxTurns,
+      maxDepth,
+      jobMaxRuntimeSeconds: this.config.agents?.job_max_runtime_seconds ?? 0,
+      modelIdleTimeoutMs: secondsToMs(this.config.agents?.model_idle_timeout_seconds ?? 300),
+      modelRequestTimeoutMs: secondsToMs(
+        this.config.agents?.model_request_timeout_seconds ?? 1800,
+      ),
+      contextInputTokens: this.config.agents?.context_input_tokens,
+      contextOutputReserveTokens: this.config.agents?.context_output_reserve_tokens ?? 64_000,
+      contextToolReserveTokens: this.config.agents?.context_tool_reserve_tokens ?? 16_000,
+      contextRecentTokens: this.config.agents?.context_recent_tokens ?? 16_000,
+      contextWorkingMemoryTokens: this.config.agents?.context_working_memory_tokens ?? 6_000,
+      contextObservationTokens: this.config.agents?.context_observation_tokens ?? 24_000,
+      contextDynamicTokens: this.config.agents?.context_dynamic_tokens ?? 2_000,
+      contextFileEvidenceTokens: this.config.agents?.context_file_evidence_tokens ?? 48_000,
+      persistApproval: (input) => this.persistApproval(approvalProjectPath, input),
+      recordObservation: (input) => this.store.addObservation(input),
+      listObservations: (threadId, limit) => this.store.listObservations(threadId, limit),
+      getObservation: (threadId, id) => this.store.getObservation(threadId, id),
+      onSpawnSubAgent: (parentId, subConfig) =>
+        Promise.resolve(this.createSubAgent(parentId, subConfig, providerId, model)),
+    };
+  }
+
+  private persistApproval(projectPath: string, input: PersistApprovalInput): ApprovalRule {
+    return this.store.addApprovalRule({
+      scope: "project",
+      projectPath,
+      ...input,
+    });
+  }
+
   private handleSessionEvent(threadId: string, event: SessionEvent): void {
     const now = new Date().toISOString();
+    const logEvent = summarizeSessionEvent(event);
+    if (logEvent) {
+      this.store.addRunEvent({ threadId, createdAt: now, ...logEvent });
+    }
 
     if (event.type === "turn_complete") {
-      this.store.updateThread(threadId, { status: "completed", updatedAt: now });
+      this.store.updateThread(threadId, { status: turnResultStatus(event.result), updatedAt: now });
     } else if (event.type === "status_changed") {
       this.store.updateThread(threadId, { status: event.status, updatedAt: now });
     } else if (event.type === "mode_changed") {
@@ -365,6 +456,12 @@ export class SessionManager {
           title: session.getTitle(),
           updatedAt: now,
         });
+        const memory = buildThreadMemory(
+          history,
+          this.store.listRunEvents(threadId, 80),
+        );
+        this.store.setThreadMemory(threadId, memory);
+        session.restoreMemory(memory);
       }
     }
   }
@@ -395,6 +492,129 @@ function storedMessageToHistory(msg: StoredMessage): Message {
     tool_call_id: msg.toolCallId,
     name: msg.name,
   };
+}
+
+function secondsToMs(seconds: number): number {
+  return Math.max(1, seconds) * 1000;
+}
+
+function defaultModelMode(providerId?: string, model?: string): string | undefined {
+  const value = `${providerId ?? ""} ${model ?? ""}`.toLocaleLowerCase();
+  return value.includes("deepseek") ? "deepseek-high" : undefined;
+}
+
+function turnResultStatus(result: { status: "completed" | "error" | "cancelled" }): ThreadSummary["status"] {
+  if (result.status === "completed") return "completed";
+  if (result.status === "cancelled") return "cancelled";
+  return "error";
+}
+
+function summarizeSessionEvent(
+  event: SessionEvent,
+): Omit<StoredRunEvent, "id" | "threadId" | "createdAt"> | null {
+  switch (event.type) {
+    case "text_delta":
+    case "thinking_delta":
+    case "mode_changed":
+      return null;
+    case "status_changed":
+      return { type: event.type, status: event.status };
+    case "tool_call":
+      return {
+        type: event.type,
+        detail: {
+          toolCallId: event.call.id,
+          toolName: event.call.function.name,
+          argumentsLength: event.call.function.arguments.length,
+        },
+      };
+    case "tool_result":
+      return {
+        type: event.type,
+        status: event.result.isError ? "error" : "completed",
+        message: event.result.isError ? event.result.content.slice(0, 500) : undefined,
+        detail: {
+          toolCallId: event.result.toolCallId,
+          toolName: event.result.name,
+          contentLength: event.result.content.length,
+          observationId: event.result.observationId,
+          rawContentLength: event.result.rawContentLength,
+          compacted: event.result.compacted,
+        },
+      };
+    case "context_diagnostics":
+      return {
+        type: event.type,
+        detail: {
+          estimatedInputTokens: event.diagnostics.estimatedInputTokens,
+          inputBudgetTokens: event.diagnostics.inputBudgetTokens,
+          maxContextTokens: event.diagnostics.maxContextTokens,
+          outputReserveTokens: event.diagnostics.outputReserveTokens,
+          toolReserveTokens: event.diagnostics.toolReserveTokens,
+          promptTokens: event.diagnostics.promptTokens,
+          completionTokens: event.diagnostics.completionTokens,
+          totalTokens: event.diagnostics.totalTokens,
+          cacheHitTokens: event.diagnostics.cacheHitTokens,
+          cacheMissTokens: event.diagnostics.cacheMissTokens,
+          suppressedObservationTokens: event.diagnostics.suppressedObservationTokens,
+          slots: event.diagnostics.slots,
+        },
+      };
+    case "approval_required":
+      return {
+        type: event.type,
+        status: "waiting",
+        detail: {
+          requestId: event.requestId,
+          toolCallId: event.call.id,
+          toolName: event.call.function.name,
+          category: event.category,
+        },
+      };
+    case "subagent_spawned":
+      return {
+        type: event.type,
+        detail: {
+          childSessionId: event.sessionId,
+          profile: event.profile,
+          toolCallId: event.toolCallId,
+        },
+      };
+    case "subagent_event":
+      return {
+        type: event.type,
+        detail: {
+          childSessionId: event.childSessionId,
+          profile: event.profile,
+          toolCallId: event.toolCallId,
+          eventType: event.event.type,
+        },
+      };
+    case "subagent_completed":
+      return {
+        type: event.type,
+        status: "completed",
+        detail: {
+          childSessionId: event.sessionId,
+          profile: event.profile,
+          toolCallId: event.toolCallId,
+          resultLength: event.result.length,
+        },
+      };
+    case "turn_complete":
+      return {
+        type: event.type,
+        status: event.result.status,
+        message: event.result.error,
+        detail: {
+          reason: event.result.reason,
+          textLength: event.result.text.length,
+          toolCallCount: event.result.toolCalls.length,
+        },
+      };
+    case "error":
+      return { type: event.type, status: "error", message: event.error };
+  }
 }
 
 function resolveDataDir(): string {

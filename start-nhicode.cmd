@@ -133,15 +133,29 @@ if not exist "apps\desktop\src-tauri\icons\icon.ico" (
 )
 
 call :FreePorts
+if !ERRORLEVEL! neq 0 (
+  echo.
+  echo  [ERROR] Could not free the local API/UI ports.
+  echo  Close any running NHI Code windows or terminal sessions, then try again.
+  pause
+  exit /b 1
+)
 
 echo  Starting NHI Code desktop app...
 echo.
 echo  Press Ctrl+C to stop.
 echo.
 
-call pnpm dev
+call node scripts\build-packages-direct.mjs
+if !ERRORLEVEL! neq 0 (
+  set EXIT_CODE=!ERRORLEVEL!
+  goto :AppFinished
+)
+
+call pnpm --filter @nhicode/desktop dev
 set EXIT_CODE=!ERRORLEVEL!
 
+:AppFinished
 echo.
 if !EXIT_CODE! neq 0 (
   echo  NHI Code exited with an error ^(code !EXIT_CODE!^).
@@ -167,9 +181,8 @@ exit /b 0
 
 :FreePorts
 REM Release stale Vite/API ports from a previous session that did not shut down cleanly.
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$ports = 5173, 3847; foreach ($port in $ports) { Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }"
-exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\free-ports.ps1" -Ports 5173,3847 -WaitSeconds 10
+exit /b !ERRORLEVEL!
 
 :InstallDeps
 if not exist "node_modules\" (

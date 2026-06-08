@@ -4,11 +4,12 @@
   "version": "0.1.0",
   "description": "NHI Code — Non-Human Intelligence coding agent for DeepSeek, Kimi, Qwen and other OpenAI-compatible models",
   "scripts": {
-    "build:packages": "pnpm -r --filter \"@nhicode/*\" --filter \"!@nhicode/desktop\" build",
+    "build:packages": "node scripts/build-packages-direct.mjs",
     "verify": "pnpm build:packages",
     "dev": "pnpm build:packages && pnpm --filter @nhicode/desktop dev",
     "build": "pnpm build:packages && pnpm --filter @nhicode/desktop build",
     "typecheck": "pnpm -r typecheck",
+    "benchmark:context": "node scripts/context-benchmark.mjs",
     "start": "pnpm --filter @nhicode/desktop start"
   },
   "engines": {

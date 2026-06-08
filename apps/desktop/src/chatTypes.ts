@@ -28,6 +28,9 @@ export interface ToolMessage {
   result?: string;
   status: "running" | "done" | "error";
   isError?: boolean;
+  observationId?: string;
+  rawContentLength?: number;
+  compacted?: boolean;
 }
 
 export interface SubAgentMessage {
@@ -55,6 +58,7 @@ export interface PendingApproval {
   args: string;
   scopes: string[];
   category: string;
+  suggestedShellPrefix?: string;
 }
 
 export interface StatusNotice {

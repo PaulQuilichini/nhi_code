@@ -34,6 +34,9 @@ export interface ToolResult {
   name: string;
   content: string;
   isError?: boolean;
+  observationId?: string;
+  rawContentLength?: number;
+  compacted?: boolean;
 }
 
 // ─── Model Provider ──────────────────────────────────────────────────────────
@@ -59,21 +62,38 @@ export interface ChatRequest {
   tools?: ToolDefinition[];
   temperature?: number;
   maxTokens?: number;
+  generationConfig?: Record<string, unknown>;
   stream?: boolean;
+  idleTimeoutMs?: number;
+  requestTimeoutMs?: number;
   signal?: AbortSignal;
 }
+
+export type TurnStopReason =
+  | "cancelled"
+  | "job_timeout"
+  | "max_turns_exceeded"
+  | "model_output_limit"
+  | "model_timeout"
+  | "provider_error"
+  | "session_error"
+  | "stream_incomplete";
 
 export type ChatEvent =
   | { type: "text_delta"; content: string }
   | { type: "thinking_delta"; content: string }
   | { type: "tool_call_delta"; index: number; id?: string; name?: string; arguments?: string }
-  | { type: "done"; message: Message; usage?: TokenUsage }
-  | { type: "error"; error: string };
+  | { type: "done"; message: Message; usage?: TokenUsage; finishReason?: string }
+  | { type: "error"; error: string; reason?: TurnStopReason };
 
 export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
+  promptCacheHitTokens?: number;
+  promptCacheMissTokens?: number;
+  reasoningTokens?: number;
 }
 
 export interface ModelProviderConfig {
@@ -112,6 +132,10 @@ export const TOOL_CATEGORY: Record<string, ApprovalCategory> = {
   git_diff: "git",
   git_commit: "git",
   spawn_subagent: "agent",
+  expand_observation: "agent",
+  promote_context: "agent",
+  drop_context: "agent",
+  summarize_phase: "agent",
 };
 
 export const CATEGORY_LABEL: Record<ApprovalCategory, string> = {
@@ -119,7 +143,7 @@ export const CATEGORY_LABEL: Record<ApprovalCategory, string> = {
   shell: "Shell commands",
   git: "Git operations",
   web: "Web access",
-  agent: "Sub-agents",
+  agent: "Agent controls",
 };
 
 export interface ModeProfile {
@@ -148,6 +172,20 @@ export interface PolicyRule {
   action?: "allow" | "deny" | "auto_approve" | "require_approval" | "deny_write";
 }
 
+export type ApprovalRuleKind = "tool" | "category" | "shell_prefix";
+
+export interface ApprovalRule {
+  id: string;
+  scope: "project";
+  projectPath: string;
+  kind: ApprovalRuleKind;
+  toolName?: string;
+  category?: ApprovalCategory;
+  prefix?: string;
+  createdAt: string;
+  lastUsedAt?: string;
+}
+
 // ─── Sessions & Events ───────────────────────────────────────────────────────
 
 export type SessionStatus = "idle" | "running" | "waiting_approval" | "completed" | "error" | "cancelled";
@@ -158,6 +196,7 @@ export interface SessionConfig {
   mode: string;
   model: string;
   providerId: string;
+  modelMode?: string;
   parentId?: string;
   agentProfile?: string;
 }
@@ -177,8 +216,10 @@ export interface TurnResult {
   thinking?: string;
   toolCalls: ToolCall[];
   usage?: TokenUsage;
+  contextDiagnostics?: ContextDiagnostics;
   status: "completed" | "error" | "cancelled";
   error?: string;
+  reason?: TurnStopReason;
 }
 
 export type SessionEvent =
@@ -186,6 +227,7 @@ export type SessionEvent =
   | { type: "thinking_delta"; content: string }
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
+  | { type: "context_diagnostics"; diagnostics: ContextDiagnostics }
   | { type: "approval_required"; call: ToolCall; scopes: ApprovalScope[]; requestId: string; category: ApprovalCategory }
   | { type: "mode_changed"; mode: string }
   | { type: "subagent_spawned"; sessionId: string; profile: string; task: string; toolCallId: string }
@@ -229,6 +271,17 @@ export const NhiCodeConfigSchema = z.object({
       max_threads: z.number().optional(),
       max_depth: z.number().optional(),
       job_max_runtime_seconds: z.number().optional(),
+      model_idle_timeout_seconds: z.number().optional(),
+      model_request_timeout_seconds: z.number().optional(),
+      shell_timeout_seconds: z.number().optional(),
+      context_input_tokens: z.number().optional(),
+      context_output_reserve_tokens: z.number().optional(),
+      context_tool_reserve_tokens: z.number().optional(),
+      context_recent_tokens: z.number().optional(),
+      context_working_memory_tokens: z.number().optional(),
+      context_observation_tokens: z.number().optional(),
+      context_dynamic_tokens: z.number().optional(),
+      context_file_evidence_tokens: z.number().optional(),
     })
     .optional(),
   windows: z
@@ -261,6 +314,7 @@ export interface ThreadSummary {
   projectId?: string;
   mode: string;
   model: string;
+  modelMode?: string;
   providerId?: string;
   status: SessionStatus;
   createdAt: string;
@@ -282,8 +336,71 @@ export interface ApprovalResponse {
     | "approve_once"
     | "approve_session"
     | "approve_project"
+    | "approve_shell_prefix_project"
     | "approve_category_session"
     | "approve_category_project"
     | "deny";
   category?: ApprovalCategory;
+  shellPrefix?: string;
+}
+
+export type ObservationKind =
+  | "file_read"
+  | "file_write"
+  | "file_edit"
+  | "search"
+  | "shell"
+  | "git"
+  | "subagent"
+  | "other";
+
+export interface ObservationRecord {
+  id: string;
+  threadId: string;
+  toolCallId: string;
+  toolName: string;
+  kind: ObservationKind;
+  summary: string;
+  content: string;
+  compactContent: string;
+  isError?: boolean;
+  metadata?: Record<string, unknown>;
+  tokenEstimate: number;
+  rawTokenEstimate: number;
+  createdAt: string;
+}
+
+export type ContextSlotName =
+  | "stable_prefix"
+  | "working_memory"
+  | "recent_history"
+  | "observations"
+  | "dynamic_state"
+  | "user_request";
+
+export interface ContextSlotDiagnostics {
+  name: ContextSlotName;
+  tokens: number;
+  budgetTokens?: number;
+  messageCount: number;
+  truncated?: boolean;
+}
+
+export interface ContextDiagnostics {
+  threadId?: string;
+  model?: string;
+  providerId?: string;
+  createdAt: string;
+  estimatedInputTokens: number;
+  inputBudgetTokens: number;
+  maxContextTokens: number;
+  outputReserveTokens: number;
+  toolReserveTokens: number;
+  suppressedObservationTokens: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  slots: ContextSlotDiagnostics[];
 }

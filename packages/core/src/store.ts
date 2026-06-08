@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Project, ThreadSummary } from "@nhicode/shared";
+import type { ApprovalRule, ObservationRecord, Project, ThreadSummary } from "@nhicode/shared";
 import { normalizePathKey, projectNameFromPath } from "./paths.js";
 
 interface StoredMessage {
@@ -19,11 +19,32 @@ interface StoreData {
   projects: Project[];
   threads: ThreadSummary[];
   messages: StoredMessage[];
+  threadMemories: StoredThreadMemory[];
+  runEvents: StoredRunEvent[];
+  approvalRules: ApprovalRule[];
+  observations: ObservationRecord[];
+}
+
+interface StoredThreadMemory {
+  threadId: string;
+  content: string;
+  updatedAt: string;
+}
+
+interface StoredRunEvent {
+  id: string;
+  threadId: string;
+  createdAt: string;
+  type: string;
+  status?: string;
+  message?: string;
+  detail?: Record<string, unknown>;
 }
 
 export class JsonStore {
   private path: string;
   private data: StoreData;
+  private maxRunEvents = 5_000;
 
   constructor(dataDir: string, defaultProjectPath?: string) {
     this.path = join(dataDir, "store.json");
@@ -40,12 +61,24 @@ export class JsonStore {
           projects: raw.projects ?? [],
           threads: raw.threads ?? [],
           messages: raw.messages ?? [],
+          threadMemories: raw.threadMemories ?? [],
+          runEvents: raw.runEvents ?? [],
+          approvalRules: raw.approvalRules ?? [],
+          observations: raw.observations ?? [],
         };
       }
     } catch {
       // corrupt file — reset
     }
-    return { projects: [], threads: [], messages: [] };
+    return {
+      projects: [],
+      threads: [],
+      messages: [],
+      threadMemories: [],
+      runEvents: [],
+      approvalRules: [],
+      observations: [],
+    };
   }
 
   private migrateProjects(defaultProjectPath?: string): void {
@@ -202,12 +235,52 @@ export class JsonStore {
     const idx = this.data.projects.findIndex((p) => p.id === id);
     if (idx < 0) return false;
 
+    const project = this.data.projects[idx];
     const threadIds = new Set(
       this.data.threads.filter((t) => t.projectId === id).map((t) => t.id),
     );
     this.data.threads = this.data.threads.filter((t) => t.projectId !== id);
     this.data.messages = this.data.messages.filter((m) => !threadIds.has(m.threadId));
+    this.data.threadMemories = this.data.threadMemories.filter((m) => !threadIds.has(m.threadId));
+    this.data.observations = this.data.observations.filter((m) => !threadIds.has(m.threadId));
+    this.data.approvalRules = this.data.approvalRules.filter(
+      (r) => normalizePathKey(r.projectPath) !== normalizePathKey(project.path),
+    );
     this.data.projects.splice(idx, 1);
+    this.persist();
+    return true;
+  }
+
+  listApprovalRules(projectPath?: string): ApprovalRule[] {
+    const key = projectPath ? normalizePathKey(projectPath) : undefined;
+    return this.data.approvalRules
+      .filter((rule) => !key || normalizePathKey(rule.projectPath) === key)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }
+
+  addApprovalRule(input: Omit<ApprovalRule, "id" | "createdAt">): ApprovalRule {
+    const existing = this.data.approvalRules.find((rule) => approvalRuleEquals(rule, input));
+    const now = new Date().toISOString();
+    if (existing) {
+      existing.lastUsedAt = now;
+      this.persist();
+      return existing;
+    }
+
+    const rule: ApprovalRule = {
+      id: randomUUID(),
+      createdAt: now,
+      ...input,
+    };
+    this.data.approvalRules.unshift(rule);
+    this.persist();
+    return rule;
+  }
+
+  deleteApprovalRule(id: string): boolean {
+    const before = this.data.approvalRules.length;
+    this.data.approvalRules = this.data.approvalRules.filter((rule) => rule.id !== id);
+    if (this.data.approvalRules.length === before) return false;
     this.persist();
     return true;
   }
@@ -233,6 +306,22 @@ export class JsonStore {
   setThreadMessages(threadId: string, messages: StoredMessage[]): void {
     this.data.messages = this.data.messages.filter((m) => m.threadId !== threadId);
     this.data.messages.push(...messages);
+    this.persist();
+  }
+
+  getThreadMemory(threadId: string): StoredThreadMemory | undefined {
+    return this.data.threadMemories.find((m) => m.threadId === threadId);
+  }
+
+  setThreadMemory(threadId: string, content: string): void {
+    const updatedAt = new Date().toISOString();
+    const idx = this.data.threadMemories.findIndex((m) => m.threadId === threadId);
+    const memory: StoredThreadMemory = { threadId, content, updatedAt };
+    if (idx >= 0) {
+      this.data.threadMemories[idx] = memory;
+    } else {
+      this.data.threadMemories.push(memory);
+    }
     this.persist();
   }
 
@@ -271,6 +360,53 @@ export class JsonStore {
     this.data.messages.push(msg);
     this.persist();
   }
+
+  addRunEvent(event: Omit<StoredRunEvent, "id">): void {
+    this.data.runEvents.push({ id: randomUUID(), ...event });
+    if (this.data.runEvents.length > this.maxRunEvents) {
+      this.data.runEvents.splice(0, this.data.runEvents.length - this.maxRunEvents);
+    }
+    this.persist();
+  }
+
+  listRunEvents(threadId: string, limit = 200): StoredRunEvent[] {
+    return this.data.runEvents.filter((e) => e.threadId === threadId).slice(-limit);
+  }
+
+  addObservation(input: Omit<ObservationRecord, "id" | "createdAt">): ObservationRecord {
+    const observation: ObservationRecord = {
+      id: `obs_${this.data.observations.length + 1}_${randomUUID().slice(0, 8)}`,
+      createdAt: new Date().toISOString(),
+      ...input,
+    };
+    this.data.observations.push(observation);
+    this.persist();
+    return observation;
+  }
+
+  listObservations(threadId: string, limit = 80): ObservationRecord[] {
+    return this.data.observations
+      .filter((obs) => obs.threadId === threadId)
+      .slice(-limit);
+  }
+
+  getObservation(threadId: string, id: string): ObservationRecord | undefined {
+    return this.data.observations.find((obs) => obs.threadId === threadId && obs.id === id);
+  }
 }
 
-export type { StoredMessage };
+function approvalRuleEquals(
+  rule: ApprovalRule,
+  input: Omit<ApprovalRule, "id" | "createdAt">,
+): boolean {
+  return (
+    rule.scope === input.scope &&
+    normalizePathKey(rule.projectPath) === normalizePathKey(input.projectPath) &&
+    rule.kind === input.kind &&
+    rule.toolName === input.toolName &&
+    rule.category === input.category &&
+    rule.prefix === input.prefix
+  );
+}
+
+export type { StoredMessage, StoredRunEvent, StoredThreadMemory };

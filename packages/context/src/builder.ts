@@ -4,6 +4,12 @@ import { join, relative, resolve } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Message } from "@nhicode/shared";
+import {
+  buildBudgetedContext,
+  buildBudgetedMessages,
+  type BuildBudgetedContextResult,
+  type ContextBudget,
+} from "./budget.js";
 import { sanitizeMessageHistory, trimMessageHistory } from "./history.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,13 +29,26 @@ Guidelines:
 - Read relevant files before making changes
 - Make minimal, focused edits
 - When stuck, explore the codebase with grep/glob before guessing
-- Prefer edit_file for surgical changes, write_file for new files`;
+- Prefer edit_file for surgical changes, write_file for new files
+- Use shell for commands, not for creating source files with echo/redirection
+- For temporary multi-line code, use the shell tool's script + interpreter fields instead of inline node -e, python -c, heredocs, or echo pipes`;
 
 export interface ContextOptions {
   cwd: string;
   modeAddendum?: string;
   agentPrompt?: string;
   maxHistoryMessages?: number;
+}
+
+export interface MessageBuildOptions {
+  maxHistoryMessages?: number;
+  workingMemory?: string | null;
+  dynamicContext?: string | null;
+  observations?: import("@nhicode/shared").ObservationRecord[];
+  threadId?: string;
+  model?: string;
+  providerId?: string;
+  budget?: ContextBudget;
 }
 
 export class ContextBuilder {
@@ -53,11 +72,6 @@ export class ContextBuilder {
       parts.push("\n\n## Project Instructions (AGENTS.md)\n\n" + agentsMd);
     }
 
-    const gitContext = await this.loadGitContext(options.cwd);
-    if (gitContext) {
-      parts.push("\n\n## Git Status\n\n```\n" + gitContext + "\n```");
-    }
-
     parts.push(`\n\n## Workspace\nWorking directory: ${options.cwd}`);
 
     this.systemPrompt = parts.join("");
@@ -68,14 +82,51 @@ export class ContextBuilder {
     systemPrompt: string,
     history: Message[],
     userMessage: string,
-    maxHistory = 40,
+    options: MessageBuildOptions = {},
   ): Message[] {
-    const trimmed = trimMessageHistory(history, maxHistory);
+    if (options.budget) {
+      return buildBudgetedMessages({
+        systemPrompt,
+        history,
+        userMessage,
+        workingMemory: options.workingMemory,
+        dynamicContext: options.dynamicContext,
+        observations: options.observations,
+        threadId: options.threadId,
+        model: options.model,
+        providerId: options.providerId,
+        budget: options.budget,
+      });
+    }
+
+    const trimmed = trimMessageHistory(history, options.maxHistoryMessages ?? 40);
     return [
       { role: "system", content: systemPrompt },
+      ...memoryMessage(options.workingMemory),
       ...trimmed,
+      ...dynamicMessage(options.dynamicContext),
       { role: "user", content: userMessage },
     ];
+  }
+
+  buildContext(
+    systemPrompt: string,
+    history: Message[],
+    userMessage: string,
+    options: MessageBuildOptions = {},
+  ): BuildBudgetedContextResult {
+    return buildBudgetedContext({
+      systemPrompt,
+      history,
+      userMessage,
+      workingMemory: options.workingMemory,
+      dynamicContext: options.dynamicContext,
+      observations: options.observations,
+      threadId: options.threadId,
+      model: options.model,
+      providerId: options.providerId,
+      budget: options.budget,
+    });
   }
 
   compactHistory(messages: Message[], maxMessages = 30): Message[] {
@@ -160,6 +211,11 @@ export class ContextBuilder {
     }
   }
 
+  async buildDynamicContext(cwd: string): Promise<string | null> {
+    const gitContext = await this.loadGitContext(cwd);
+    return gitContext ? "Git status:\n```\n" + gitContext + "\n```" : null;
+  }
+
   reset(): void {
     this.systemPrompt = null;
   }
@@ -178,7 +234,18 @@ function instructionDirs(root: string, cwd: string): string[] {
     current = join(current, segment);
     dirs.push(current);
   }
+
   return dirs;
+}
+
+function memoryMessage(memory?: string | null): Message[] {
+  const content = memory?.trim();
+  return content ? [{ role: "system", content: `## Working Memory\n\n${content}` }] : [];
+}
+
+function dynamicMessage(dynamicContext?: string | null): Message[] {
+  const content = dynamicContext?.trim();
+  return content ? [{ role: "system", content: `## Current Workspace State\n\n${content}` }] : [];
 }
 
 export const AGENT_PROFILES: Record<string, { mode: string; systemPrompt: string; maxTurns: number }> = {
