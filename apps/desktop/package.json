@@ -12,7 +12,7 @@
     "build": "pnpm build:web && pnpm build:server && tauri build",
     "start": "node dist-server/bundle.cjs",
     "tauri": "tauri",
-    "icons": "tauri icon app-icon.svg",
+    "icons": "tauri icon ../../nhi_code_icon.png",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
   },
   "dependencies": {
