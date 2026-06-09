@@ -1,6 +1,6 @@
 # NHI Code
 
-**NHI** = **Non-Human Intelligence** — a Codex-like **native desktop** AI coding agent for DeepSeek v4, Kimi Code, Qwen Coder, and other OpenAI-compatible models.
+**NHI** = **Non-Human Intelligence** — a **native desktop** AI coding agent for DeepSeek v4, Kimi Code, Qwen Coder, and other OpenAI-compatible models.
 
 ## Features
 
