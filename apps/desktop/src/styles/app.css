@@ -381,7 +381,7 @@
 }
 
 .context-diagnostics summary {
-  min-height: 30px;
+  min-height: 36px;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -389,6 +389,7 @@
   cursor: pointer;
   user-select: none;
   overflow: hidden;
+  flex-wrap: wrap;
 }
 
 .context-diagnostics summary span {
@@ -537,6 +538,12 @@
 }
 
 .model-mode-select {
+  font-size: 12px;
+  padding: 6px 10px;
+  max-width: 170px;
+}
+
+.context-tier-select {
   font-size: 12px;
   padding: 6px 10px;
   max-width: 170px;
@@ -1035,6 +1042,61 @@
   background: var(--bg-secondary);
 }
 
+.queued-prompts {
+  max-width: 800px;
+  margin: 0 auto 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-tertiary);
+}
+
+.queued-prompts-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+.queued-prompts-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.queued-prompt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.queued-prompt-row + .queued-prompt-row {
+  border-top: 1px solid var(--border);
+}
+
+.queued-prompt-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.queued-prompt-remove {
+  flex-shrink: 0;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.queued-prompt-remove:hover {
+  color: var(--error);
+}
+
 .input-wrapper {
   max-width: 800px;
   margin: 0 auto;
@@ -1046,7 +1108,7 @@
   min-height: 48px;
   max-height: 200px;
   resize: none;
-  padding: 12px 48px 12px 16px;
+  padding: 12px 176px 12px 16px;
   border-radius: var(--radius-lg);
   line-height: 1.5;
 }
@@ -1055,8 +1117,9 @@
   position: absolute;
   right: 8px;
   bottom: 8px;
-  width: 32px;
+  min-width: 32px;
   height: 32px;
+  padding: 0 12px;
   background: var(--accent);
   color: white;
   border-radius: var(--radius);
@@ -1077,7 +1140,7 @@
 
 .cancel-btn {
   position: absolute;
-  right: 48px;
+  right: 112px;
   bottom: 8px;
   padding: 6px 12px;
   font-size: 12px;
@@ -1087,6 +1150,26 @@
 
 .cancel-btn:hover {
   background: color-mix(in srgb, var(--error) 10%, transparent);
+}
+
+.queue-btn {
+  position: absolute;
+  right: 168px;
+  bottom: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-radius: var(--radius);
+}
+
+.queue-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.queue-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .input-hint {
@@ -1239,6 +1322,24 @@
   padding: 10px 0;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.settings-inline-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-inline-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-help {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .approval-rule-list {

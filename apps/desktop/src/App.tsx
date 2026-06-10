@@ -3,8 +3,10 @@ import type {
   SessionEvent,
   SessionStatus,
   Project,
+  QueuedPrompt,
   ThreadSummary,
   ApprovalResponse,
+  ContextBudgetTier,
   TurnResult,
   ContextDiagnostics,
 } from "@nhicode/shared";
@@ -14,14 +16,19 @@ import {
   fetchThreadMessages,
   fetchThreadEvents,
   fetchThreadObservations,
+  fetchQueuedPrompts,
   fetchBootstrap,
   createThread,
   createProject,
   updateProject,
   deleteProject,
   sendMessage,
+  queuePrompt,
+  deleteQueuedPrompt,
+  steerThread,
   setThreadMode,
   setThreadModelMode,
+  setThreadContextBudgetTier,
   cancelThread,
   respondToApproval,
   connectWebSocket,
@@ -68,7 +75,9 @@ const BOOTSTRAP_RETRY_DELAY_MS = 500;
 
 function defaultModelMode(providerId?: string, model?: string): string | undefined {
   const value = `${providerId ?? ""} ${model ?? ""}`.toLocaleLowerCase();
-  return value.includes("deepseek") ? "deepseek-high" : undefined;
+  if (value.includes("deepseek")) return "deepseek-high";
+  if (supportsKimiThinking(providerId, model)) return "kimi-on";
+  return undefined;
 }
 
 function modelModeForRequest(
@@ -76,7 +85,13 @@ function modelModeForRequest(
   model: string,
   modelMode: string | undefined,
 ): string | undefined {
-  return defaultModelMode(providerId, model) ? modelMode ?? "deepseek-high" : undefined;
+  const fallback = defaultModelMode(providerId, model);
+  return fallback ? modelMode ?? fallback : undefined;
+}
+
+function supportsKimiThinking(providerId?: string, model?: string): boolean {
+  const value = `${providerId ?? ""} ${model ?? ""}`.toLocaleLowerCase();
+  return value.includes("kimi") && /^kimi-k2\./.test(model ?? "");
 }
 
 function suggestedShellPrefix(args: string): string | undefined {
@@ -187,8 +202,20 @@ function latestContextDiagnostics(events: StoredRunEventDto[]): ContextDiagnosti
   return {
     createdAt: event.createdAt,
     estimatedInputTokens: numberDetail(detail.estimatedInputTokens),
+    adjustedInputTokens: optionalNumberDetail(detail.adjustedInputTokens),
+    estimatedToolTokens: optionalNumberDetail(detail.estimatedToolTokens),
     inputBudgetTokens: numberDetail(detail.inputBudgetTokens),
     maxContextTokens: numberDetail(detail.maxContextTokens),
+    contextBudgetTier: isContextBudgetTier(detail.contextBudgetTier)
+      ? detail.contextBudgetTier
+      : undefined,
+    tokenSafetyFactor: optionalNumberDetail(detail.tokenSafetyFactor),
+    promptInflationFactor: optionalNumberDetail(detail.promptInflationFactor),
+    promptCeilingTokens: optionalNumberDetail(detail.promptCeilingTokens),
+    hardPromptCeilingTokens: optionalNumberDetail(detail.hardPromptCeilingTokens),
+    compactionCount: optionalNumberDetail(detail.compactionCount),
+    modelTurnsSinceCompaction: optionalNumberDetail(detail.modelTurnsSinceCompaction),
+    toolCallsSinceCompaction: optionalNumberDetail(detail.toolCallsSinceCompaction),
     outputReserveTokens: numberDetail(detail.outputReserveTokens),
     toolReserveTokens: numberDetail(detail.toolReserveTokens),
     suppressedObservationTokens: numberDetail(detail.suppressedObservationTokens),
@@ -201,12 +228,48 @@ function latestContextDiagnostics(events: StoredRunEventDto[]): ContextDiagnosti
   };
 }
 
+interface TokenTotals {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+function tokenTotalsFromEvents(events: StoredRunEventDto[]): TokenTotals {
+  return events.reduce<TokenTotals>(
+    (totals, event) => {
+      if (event.type !== "turn_complete" || !event.detail) return totals;
+      return {
+        promptTokens: totals.promptTokens + numberDetail(event.detail.promptTokens),
+        completionTokens:
+          totals.completionTokens + numberDetail(event.detail.completionTokens),
+        totalTokens: totals.totalTokens + numberDetail(event.detail.totalTokens),
+      };
+    },
+    { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+  );
+}
+
+function addTokenUsage(
+  totals: TokenTotals,
+  usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number },
+): TokenTotals {
+  return {
+    promptTokens: totals.promptTokens + (usage?.promptTokens ?? 0),
+    completionTokens: totals.completionTokens + (usage?.completionTokens ?? 0),
+    totalTokens: totals.totalTokens + (usage?.totalTokens ?? 0),
+  };
+}
+
 function numberDetail(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function optionalNumberDetail(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function isContextBudgetTier(value: unknown): value is ContextBudgetTier {
+  return value === "compact" || value === "long" || value === "full";
 }
 
 export default function App() {
@@ -225,6 +288,7 @@ export default function App() {
   const [model, setModel] = useState("deepseek-v4-pro");
   const [providerId, setProviderId] = useState("deepseek");
   const [modelMode, setModelMode] = useState<string | undefined>("deepseek-high");
+  const [contextBudgetTier, setContextBudgetTier] = useState<ContextBudgetTier>("compact");
   const [config, setConfig] = useState<Config | null>(null);
   const [providers, setProviders] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
@@ -232,6 +296,12 @@ export default function App() {
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [statusNotice, setStatusNotice] = useState<StatusNotice | null>(null);
   const [contextDiagnostics, setContextDiagnostics] = useState<ContextDiagnostics | null>(null);
+  const [queuedPrompts, setQueuedPrompts] = useState<QueuedPrompt[]>([]);
+  const [threadTokenUsage, setThreadTokenUsage] = useState<TokenTotals>({
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  });
   const wsRef = useRef<WebSocket | null>(null);
   const streamBufferRef = useRef({ text: "", thinking: "" });
   const lastActivityAtRef = useRef(0);
@@ -274,6 +344,7 @@ export default function App() {
           const boot = await fetchBootstrap();
           setProviders(boot.providers);
           setConfig(boot.config);
+          setContextBudgetTier(boot.config.default?.context_budget_tier ?? "compact");
           setProjects(boot.projects);
           setThreads(boot.threads);
 
@@ -348,6 +419,9 @@ export default function App() {
     (threadId: string, result: TurnResult) => {
       const nextStatus = turnResultUiStatus(result);
       if (result.contextDiagnostics) setContextDiagnostics(result.contextDiagnostics);
+      if (result.usage) {
+        setThreadTokenUsage((prev) => addTokenUsage(prev, result.usage));
+      }
       setMessages((prev) => mergeFinalTurnMessages(prev, result));
       setSessionStatusImmediate(nextStatus);
       updateThreadStatus(threadId, nextStatus);
@@ -363,6 +437,7 @@ export default function App() {
       setActivityLabel("");
       streamBufferRef.current = { text: "", thinking: "" };
       void fetchThreads().then(setThreads);
+      void fetchQueuedPrompts(threadId).then(setQueuedPrompts).catch(() => {});
     },
     [clearNotice, setSessionStatusImmediate, showNotice, updateThreadStatus],
   );
@@ -373,6 +448,18 @@ export default function App() {
       touchActivity();
 
       switch (event.type) {
+        case "queued_prompt_started":
+          setQueuedPrompts((prev) => prev.filter((prompt) => prompt.id !== event.promptId));
+          streamBufferRef.current = { text: "", thinking: "" };
+          setSessionStatusImmediate("running");
+          setActivityLabel("Working...");
+          if (threadId) updateThreadStatus(threadId, "running");
+          setMessages((prev) => [
+            ...closeStreamingMessages(prev),
+            { id: `queued-user-${event.promptId}`, role: "user", content: event.text },
+          ]);
+          break;
+
         case "text_delta":
           setActivityLabel("Writing…");
           streamBufferRef.current.text = applyStreamDelta(
@@ -681,6 +768,8 @@ export default function App() {
       setSessionStatusImmediate("idle");
       setActivityLabel("");
       setContextDiagnostics(null);
+      setQueuedPrompts([]);
+      setThreadTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
       clearNotice();
       reconnectAttemptsRef.current = 0;
       streamBufferRef.current = { text: "", thinking: "" };
@@ -692,6 +781,7 @@ export default function App() {
         setModel(thread.model);
         setProviderId(nextProviderId);
         setModelMode(thread.modelMode ?? defaultModelMode(nextProviderId, thread.model));
+        setContextBudgetTier(thread.contextBudgetTier ?? "compact");
         if (thread.projectId) {
           setActiveProjectId(thread.projectId);
           localStorage.setItem("nhicode_active_project", thread.projectId);
@@ -704,16 +794,21 @@ export default function App() {
       connectWs(id);
 
       try {
-        const [stored, observations, events] = await Promise.all([
+        const [stored, observations, events, queue] = await Promise.all([
           fetchThreadMessages(id),
           fetchThreadObservations(id),
           fetchThreadEvents(id),
+          fetchQueuedPrompts(id),
         ]);
         setMessages(storedMessagesToChat(stored, observations));
         setContextDiagnostics(latestContextDiagnostics(events));
+        setThreadTokenUsage(tokenTotalsFromEvents(events));
+        setQueuedPrompts(queue);
       } catch {
         setMessages([]);
         setContextDiagnostics(null);
+        setQueuedPrompts([]);
+        setThreadTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
       }
     },
     [threads, providerId, connectWs, clearNotice, setSessionStatusImmediate],
@@ -772,6 +867,8 @@ export default function App() {
         if (thread?.projectId === projectId) {
           setActiveThreadId(null);
           setMessages([]);
+          setQueuedPrompts([]);
+          setThreadTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
           localStorage.removeItem("nhicode_active_thread");
           wsRef.current?.close();
         }
@@ -812,6 +909,7 @@ export default function App() {
         model,
         providerId,
         modelMode: selectedModelMode,
+        contextBudgetTier,
       });
       const summary: ThreadSummary = {
         id: thread.id,
@@ -821,6 +919,8 @@ export default function App() {
         mode: thread.mode,
         model: thread.model,
         modelMode: thread.modelMode ?? selectedModelMode,
+        contextBudgetTier: thread.contextBudgetTier ?? contextBudgetTier,
+        agentCarefulness: thread.agentCarefulness,
         providerId: thread.providerId ?? providerId,
         status: thread.status as ThreadSummary["status"],
         createdAt: new Date().toISOString(),
@@ -831,6 +931,8 @@ export default function App() {
       setActiveThreadId(thread.id);
       setMessages([]);
       setContextDiagnostics(null);
+      setQueuedPrompts([]);
+      setThreadTokenUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
       setSessionStatusImmediate("idle");
       setActivityLabel("");
       clearNotice();
@@ -886,6 +988,37 @@ export default function App() {
     }
   };
 
+  const handleSteer = async (text: string) => {
+    if (!activeThreadId || !isBusy) return;
+    try {
+      await steerThread(activeThreadId, text);
+      showNotice("info", "Steering added for the next model step.");
+    } catch (err) {
+      showNotice("error", err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleQueuePrompt = async (text: string) => {
+    if (!activeThreadId) return;
+    try {
+      const prompt = await queuePrompt(activeThreadId, text);
+      setQueuedPrompts((prev) => [...prev, prompt]);
+      showNotice("info", "Prompt queued for after the current run.");
+    } catch (err) {
+      showNotice("error", err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDeleteQueuedPrompt = async (promptId: string) => {
+    if (!activeThreadId) return;
+    try {
+      await deleteQueuedPrompt(activeThreadId, promptId);
+      setQueuedPrompts((prev) => prev.filter((prompt) => prompt.id !== promptId));
+    } catch (err) {
+      showNotice("error", err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const handleModeChange = async (newMode: string) => {
     setMode(newMode);
     if (activeThreadId) {
@@ -911,6 +1044,20 @@ export default function App() {
         prev.map((thread) =>
           thread.id === activeThreadId
             ? { ...thread, modelMode: newModelMode, updatedAt: new Date().toISOString() }
+            : thread,
+        ),
+      );
+    }
+  };
+
+  const handleContextBudgetTierChange = async (newTier: ContextBudgetTier) => {
+    setContextBudgetTier(newTier);
+    if (activeThreadId) {
+      await setThreadContextBudgetTier(activeThreadId, newTier);
+      setThreads((prev) =>
+        prev.map((thread) =>
+          thread.id === activeThreadId
+            ? { ...thread, contextBudgetTier: newTier, updatedAt: new Date().toISOString() }
             : thread,
         ),
       );
@@ -986,6 +1133,7 @@ export default function App() {
         model={model}
         providerId={providerId}
         modelMode={modelMode}
+        contextBudgetTier={contextBudgetTier}
         config={config}
         projectName={activeProject?.name}
         hasActiveThread={!!activeThreadId}
@@ -994,11 +1142,17 @@ export default function App() {
         onModelChange={handleModelChange}
         onProviderChange={handleProviderChange}
         onModelModeChange={(value) => void handleModelModeChange(value)}
+        onContextBudgetTierChange={(value) => void handleContextBudgetTierChange(value)}
         onCancel={handleCancel}
         onNewThread={handleChatNewThread}
         statusNotice={statusNotice}
         onDismissNotice={clearNotice}
         contextDiagnostics={contextDiagnostics}
+        threadTokenUsage={threadTokenUsage}
+        queuedPrompts={queuedPrompts}
+        onSteer={(text) => void handleSteer(text)}
+        onQueuePrompt={(text) => void handleQueuePrompt(text)}
+        onDeleteQueuedPrompt={(id) => void handleDeleteQueuedPrompt(id)}
       />
       {showSettings && (
         <SettingsModal
@@ -1007,6 +1161,7 @@ export default function App() {
           activeProjectId={activeProjectId ?? undefined}
           onClose={() => setShowSettings(false)}
           onProvidersChange={setProviders}
+          onConfigChange={setConfig}
         />
       )}
       {pendingApproval && (

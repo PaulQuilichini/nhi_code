@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { basename, dirname, join } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { SessionManager } from "@nhicode/core";
-import type { ApprovalResponse } from "@nhicode/shared";
+import type { AgentCarefulness, ApprovalResponse, ContextBudgetTier } from "@nhicode/shared";
 
 const PORT = 3847;
 
@@ -48,6 +48,19 @@ async function main(): Promise<void> {
     const { providerId, apiKey } = req.body as { providerId: string; apiKey: string };
     manager.setApiKey(providerId, apiKey);
     res.json({ ok: true, providers: manager.getProviders() });
+  });
+
+  app.patch("/api/config/agents", async (req, res) => {
+    try {
+      const { max_turns } = req.body as { max_turns?: number };
+      if (max_turns !== undefined && (!Number.isFinite(max_turns) || max_turns < 0)) {
+        return res.status(400).json({ error: "max_turns must be a non-negative number" });
+      }
+      const config = await manager.updateAgentConfig({ max_turns });
+      res.json(config);
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.get("/api/projects", (_req, res) => {
@@ -132,15 +145,26 @@ async function main(): Promise<void> {
 
   app.post("/api/threads", (req, res) => {
     try {
-      const { projectId, cwd, mode, model, providerId, modelMode } = req.body as {
+      const { projectId, cwd, mode, model, providerId, modelMode, contextBudgetTier, agentCarefulness } = req.body as {
         projectId?: string;
         cwd?: string;
         mode?: string;
         model?: string;
         providerId?: string;
         modelMode?: string;
+        contextBudgetTier?: ContextBudgetTier;
+        agentCarefulness?: AgentCarefulness;
       };
-      const session = manager.createThread({ projectId, cwd, mode, model, providerId, modelMode });
+      const session = manager.createThread({
+        projectId,
+        cwd,
+        mode,
+        model,
+        providerId,
+        modelMode,
+        contextBudgetTier,
+        agentCarefulness,
+      });
       const thread = manager.getThread(session.id);
       res.json({
         id: session.id,
@@ -149,6 +173,8 @@ async function main(): Promise<void> {
         mode: session.getMode(),
         model: session.getModel(),
         modelMode: session.getModelMode(),
+        contextBudgetTier: session.getContextBudgetTier(),
+        agentCarefulness: session.getAgentCarefulness(),
         providerId: thread?.providerId,
         status: session.getStatus(),
       });
@@ -176,6 +202,46 @@ async function main(): Promise<void> {
     }
   });
 
+  app.get("/api/threads/:id/queue", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    res.json(manager.listQueuedPrompts(req.params.id));
+  });
+
+  app.post("/api/threads/:id/queue", (req, res) => {
+    try {
+      const thread = manager.getThread(req.params.id);
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+      const { text } = req.body as { text?: string };
+      if (!text?.trim()) return res.status(400).json({ error: "Prompt text is required" });
+      res.json(manager.enqueuePrompt(req.params.id, text));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete("/api/threads/:id/queue/:promptId", (req, res) => {
+    try {
+      const thread = manager.getThread(req.params.id);
+      if (!thread) return res.status(404).json({ error: "Thread not found" });
+      manager.deleteQueuedPrompt(req.params.id, req.params.promptId);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post("/api/threads/:id/steer", (req, res) => {
+    try {
+      const { text } = req.body as { text?: string };
+      if (!text?.trim()) return res.status(400).json({ error: "Steering text is required" });
+      manager.steerThread(req.params.id, text);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
   app.post("/api/threads/:id/mode", (req, res) => {
     let session;
     try {
@@ -195,6 +261,21 @@ async function main(): Promise<void> {
     const { modelMode } = req.body as { modelMode?: string };
     manager.setThreadModelMode(req.params.id, modelMode);
     res.json({ modelMode });
+  });
+
+  app.post("/api/threads/:id/context-tier", (req, res) => {
+    const thread = manager.getThread(req.params.id);
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+    const { contextBudgetTier } = req.body as { contextBudgetTier?: ContextBudgetTier };
+    if (
+      contextBudgetTier !== "compact" &&
+      contextBudgetTier !== "long" &&
+      contextBudgetTier !== "full"
+    ) {
+      return res.status(400).json({ error: "Invalid context budget tier" });
+    }
+    manager.setThreadContextBudgetTier(req.params.id, contextBudgetTier);
+    res.json({ contextBudgetTier });
   });
 
   app.post("/api/threads/:id/cancel", (req, res) => {

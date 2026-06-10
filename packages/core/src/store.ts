@@ -23,6 +23,7 @@ interface StoreData {
   runEvents: StoredRunEvent[];
   approvalRules: ApprovalRule[];
   observations: ObservationRecord[];
+  queuedPrompts: StoredQueuedPrompt[];
 }
 
 interface StoredThreadMemory {
@@ -39,6 +40,13 @@ interface StoredRunEvent {
   status?: string;
   message?: string;
   detail?: Record<string, unknown>;
+}
+
+interface StoredQueuedPrompt {
+  id: string;
+  threadId: string;
+  text: string;
+  createdAt: string;
 }
 
 export class JsonStore {
@@ -65,6 +73,7 @@ export class JsonStore {
           runEvents: raw.runEvents ?? [],
           approvalRules: raw.approvalRules ?? [],
           observations: raw.observations ?? [],
+          queuedPrompts: raw.queuedPrompts ?? [],
         };
       }
     } catch {
@@ -78,6 +87,7 @@ export class JsonStore {
       runEvents: [],
       approvalRules: [],
       observations: [],
+      queuedPrompts: [],
     };
   }
 
@@ -243,6 +253,7 @@ export class JsonStore {
     this.data.messages = this.data.messages.filter((m) => !threadIds.has(m.threadId));
     this.data.threadMemories = this.data.threadMemories.filter((m) => !threadIds.has(m.threadId));
     this.data.observations = this.data.observations.filter((m) => !threadIds.has(m.threadId));
+    this.data.queuedPrompts = this.data.queuedPrompts.filter((m) => !threadIds.has(m.threadId));
     this.data.approvalRules = this.data.approvalRules.filter(
       (r) => normalizePathKey(r.projectPath) !== normalizePathKey(project.path),
     );
@@ -373,6 +384,45 @@ export class JsonStore {
     return this.data.runEvents.filter((e) => e.threadId === threadId).slice(-limit);
   }
 
+  listQueuedPrompts(threadId: string): StoredQueuedPrompt[] {
+    return this.data.queuedPrompts
+      .filter((prompt) => prompt.threadId === threadId)
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  }
+
+  addQueuedPrompt(threadId: string, text: string): StoredQueuedPrompt {
+    const prompt: StoredQueuedPrompt = {
+      id: randomUUID(),
+      threadId,
+      text,
+      createdAt: new Date().toISOString(),
+    };
+    this.data.queuedPrompts.push(prompt);
+    this.persist();
+    return prompt;
+  }
+
+  restoreQueuedPrompt(prompt: StoredQueuedPrompt): void {
+    this.data.queuedPrompts.unshift(prompt);
+    this.persist();
+  }
+
+  deleteQueuedPrompt(id: string): boolean {
+    const before = this.data.queuedPrompts.length;
+    this.data.queuedPrompts = this.data.queuedPrompts.filter((prompt) => prompt.id !== id);
+    if (this.data.queuedPrompts.length === before) return false;
+    this.persist();
+    return true;
+  }
+
+  takeQueuedPrompt(threadId: string): StoredQueuedPrompt | undefined {
+    const index = this.data.queuedPrompts.findIndex((prompt) => prompt.threadId === threadId);
+    if (index < 0) return undefined;
+    const [prompt] = this.data.queuedPrompts.splice(index, 1);
+    this.persist();
+    return prompt;
+  }
+
   addObservation(input: Omit<ObservationRecord, "id" | "createdAt">): ObservationRecord {
     const observation: ObservationRecord = {
       id: `obs_${this.data.observations.length + 1}_${randomUUID().slice(0, 8)}`,
@@ -384,9 +434,13 @@ export class JsonStore {
     return observation;
   }
 
-  listObservations(threadId: string, limit = 80): ObservationRecord[] {
+  listObservations(threadId: string, limit = 80, afterCreatedAt?: string): ObservationRecord[] {
     return this.data.observations
-      .filter((obs) => obs.threadId === threadId)
+      .filter(
+        (obs) =>
+          obs.threadId === threadId &&
+          (!afterCreatedAt || new Date(obs.createdAt).getTime() > new Date(afterCreatedAt).getTime()),
+      )
       .slice(-limit);
   }
 
@@ -409,4 +463,4 @@ function approvalRuleEquals(
   );
 }
 
-export type { StoredMessage, StoredRunEvent, StoredThreadMemory };
+export type { StoredMessage, StoredQueuedPrompt, StoredRunEvent, StoredThreadMemory };

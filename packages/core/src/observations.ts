@@ -1,4 +1,5 @@
 import type { Message, ObservationKind, ObservationRecord, ToolCall, ToolResult } from "@nhicode/shared";
+import { observationOffersExpansion } from "@nhicode/context";
 
 const INLINE_CONTENT_CHARS = 4_000;
 const COMPACT_HEAD_CHARS = 1_800;
@@ -34,18 +35,23 @@ export function createObservationInput(
 }
 
 export function observationToolMessage(observation: ObservationRecord): Message {
+  const lines = [
+    `Observation ${observation.id} stored for ${observation.toolName}${observation.isError ? " (error)" : ""}.`,
+    `Summary: ${observation.summary}`,
+    "",
+    observation.compactContent,
+  ];
+  if (observationOffersExpansion(observation)) {
+    lines.push(
+      "",
+      `Raw output is ~${observation.rawTokenEstimate} tokens. Use expand_observation with id "${observation.id}" for exact output when needed.`,
+    );
+  }
   return {
     role: "tool",
     name: observation.toolName,
     tool_call_id: observation.toolCallId,
-    content: [
-      `Observation ${observation.id} stored for ${observation.toolName}${observation.isError ? " (error)" : ""}.`,
-      `Summary: ${observation.summary}`,
-      "",
-      observation.compactContent,
-      "",
-      `Raw output is ~${observation.rawTokenEstimate} tokens. Use expand_observation with id "${observation.id}" for exact output when needed.`,
-    ].join("\n"),
+    content: lines.join("\n"),
   };
 }
 

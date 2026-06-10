@@ -1,6 +1,11 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import type { ContextDiagnostics, SessionStatus } from "@nhicode/shared";
+import type {
+  ContextBudgetTier,
+  ContextDiagnostics,
+  QueuedPrompt,
+  SessionStatus,
+} from "@nhicode/shared";
 import type { ChatMessage, SubAgentMessage, ToolMessage, StatusNotice } from "../chatTypes";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallCard, ToolCallGroup } from "./ToolCallCard";
@@ -18,18 +23,29 @@ interface ChatPanelProps {
   statusNotice: StatusNotice | null;
   onDismissNotice: () => void;
   contextDiagnostics: ContextDiagnostics | null;
+  threadTokenUsage: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+  };
+  queuedPrompts: QueuedPrompt[];
   mode: string;
   model: string;
   providerId: string;
   modelMode?: string;
+  contextBudgetTier: ContextBudgetTier;
   config: Config | null;
   projectName?: string;
   hasActiveThread: boolean;
   onSend: (text: string) => void;
+  onSteer: (text: string) => void;
+  onQueuePrompt: (text: string) => void;
+  onDeleteQueuedPrompt: (id: string) => void;
   onModeChange: (mode: string) => void;
   onModelChange: (model: string) => void;
   onProviderChange: (id: string) => void;
   onModelModeChange: (mode?: string) => void;
+  onContextBudgetTierChange: (tier: ContextBudgetTier) => void;
   onCancel: () => void;
   onNewThread: () => void;
 }
@@ -42,8 +58,22 @@ const MODES = [
 
 const DEEPSEEK_MODES = [
   { id: "deepseek-off", label: "No reasoning" },
+  { id: "deepseek-low", label: "Low reasoning" },
+  { id: "deepseek-medium", label: "Medium reasoning" },
   { id: "deepseek-high", label: "High reasoning" },
   { id: "deepseek-max", label: "Maximum reasoning" },
+];
+
+const KIMI_MODES = [
+  { id: "kimi-off", label: "No thinking" },
+  { id: "kimi-on", label: "Thinking" },
+  { id: "kimi-preserve", label: "Preserve thinking" },
+];
+
+const CONTEXT_TIERS: Array<{ id: ContextBudgetTier; label: string }> = [
+  { id: "compact", label: "Compact context" },
+  { id: "long", label: "Long context" },
+  { id: "full", label: "Full context" },
 ];
 
 type RenderBlock =
@@ -94,18 +124,25 @@ export function ChatPanel({
   statusNotice,
   onDismissNotice,
   contextDiagnostics,
+  threadTokenUsage,
+  queuedPrompts,
   mode,
   model,
   providerId,
   modelMode,
+  contextBudgetTier,
   config,
   projectName,
   hasActiveThread,
   onSend,
+  onSteer,
+  onQueuePrompt,
+  onDeleteQueuedPrompt,
   onModeChange,
   onModelChange,
   onProviderChange,
   onModelModeChange,
+  onContextBudgetTierChange,
   onCancel,
   onNewThread,
 }: ChatPanelProps) {
@@ -118,8 +155,12 @@ export function ChatPanel({
 
   const handleSubmit = () => {
     const text = input.trim();
-    if (!text || isBusy) return;
+    if (!text) return;
     setInput("");
+    if (isBusy) {
+      onSteer(text);
+      return;
+    }
     onSend(text);
   };
 
@@ -132,7 +173,7 @@ export function ChatPanel({
 
   const modelOptions = config?.providers ?? [];
   const blocks = groupMessages(messages, isBusy);
-  const showModelMode = isDeepSeekSelection(providerId, model);
+  const modelModeOptions = modelModesForSelection(providerId, model);
   const showDisconnected =
     connectionStatus === "disconnected" || connectionStatus === "reconnecting";
   const statusText =
@@ -164,7 +205,7 @@ export function ChatPanel({
             const [pid, mid] = e.target.value.split(":");
             onProviderChange(pid);
             onModelChange(mid);
-            onModelModeChange(isDeepSeekSelection(pid, mid) ? "deepseek-high" : undefined);
+            onModelModeChange(defaultModelModeForSelection(pid, mid));
           }}
         >
           {modelOptions.map((p) => (
@@ -176,19 +217,31 @@ export function ChatPanel({
           )}
         </select>
 
-        {showModelMode && (
+        {modelModeOptions.length > 0 && (
           <select
             className="model-mode-select"
-            value={modelMode ?? "deepseek-high"}
+            value={modelMode ?? modelModeOptions[0].id}
             onChange={(e) => onModelModeChange(e.target.value)}
           >
-            {DEEPSEEK_MODES.map((m) => (
+            {modelModeOptions.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.label}
               </option>
             ))}
           </select>
         )}
+
+        <select
+          className="context-tier-select"
+          value={contextBudgetTier}
+          onChange={(e) => onContextBudgetTierChange(e.target.value as ContextBudgetTier)}
+        >
+          {CONTEXT_TIERS.map((tier) => (
+            <option key={tier.id} value={tier.id}>
+              {tier.label}
+            </option>
+          ))}
+        </select>
       </div>
 
       {hasActiveThread && (
@@ -203,7 +256,7 @@ export function ChatPanel({
       )}
 
       {hasActiveThread && contextDiagnostics && (
-        <ContextDiagnosticsBar diagnostics={contextDiagnostics} />
+        <ContextDiagnosticsBar diagnostics={contextDiagnostics} threadTokenUsage={threadTokenUsage} />
       )}
 
       {hasActiveThread && statusNotice && (
@@ -259,6 +312,29 @@ export function ChatPanel({
 
       {hasActiveThread && (
         <div className="chat-input-area">
+          {queuedPrompts.length > 0 && (
+            <div className="queued-prompts">
+              <div className="queued-prompts-header">
+                <span>Queued prompts</span>
+                <span>{queuedPrompts.length}</span>
+              </div>
+              <div className="queued-prompts-list">
+                {queuedPrompts.map((prompt) => (
+                  <div key={prompt.id} className="queued-prompt-row">
+                    <div className="queued-prompt-text">{prompt.text}</div>
+                    <button
+                      type="button"
+                      className="queued-prompt-remove"
+                      onClick={() => onDeleteQueuedPrompt(prompt.id)}
+                      aria-label="Remove queued prompt"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="input-wrapper">
             <textarea
               className="chat-input"
@@ -270,29 +346,45 @@ export function ChatPanel({
                   ? "Describe what you want to build or explore…"
                   : mode === "ask"
                     ? "Ask a question about the codebase…"
-                    : "Tell the agent what to do…"
+                    : isBusy
+                      ? "Steer the current run or queue the next prompt…"
+                      : "Tell the agent what to do…"
               }
-              disabled={isBusy}
               rows={1}
             />
             {isBusy && (
-              <button className="cancel-btn" onClick={onCancel}>
-                Cancel
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="queue-btn"
+                  onClick={() => {
+                    const text = input.trim();
+                    if (!text) return;
+                    setInput("");
+                    onQueuePrompt(text);
+                  }}
+                  disabled={!input.trim()}
+                >
+                  Queue
+                </button>
+                <button className="cancel-btn" onClick={onCancel}>
+                  Cancel
+                </button>
+              </>
             )}
             <button
               className="send-btn"
               onClick={handleSubmit}
-              disabled={!input.trim() || isBusy}
+              disabled={!input.trim()}
             >
-              ↑
+              {isBusy ? "Steer" : "↑"}
             </button>
           </div>
           <div className="input-hint">
             {isBusy ? (
               <span className="input-activity">
                 <span className="tool-spinner input-activity-spinner" aria-hidden />
-                {statusText}
+                {statusText} Use Steer for the current run or Queue for the next prompt.
               </span>
             ) : (
               <>
@@ -391,16 +483,38 @@ function AgentTurn({
   );
 }
 
-function ContextDiagnosticsBar({ diagnostics }: { diagnostics: ContextDiagnostics }) {
-  const prompt = diagnostics.promptTokens ?? diagnostics.estimatedInputTokens;
+function ContextDiagnosticsBar({
+  diagnostics,
+  threadTokenUsage,
+}: {
+  diagnostics: ContextDiagnostics;
+  threadTokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number };
+}) {
+  const prompt = diagnostics.promptTokens ?? diagnostics.adjustedInputTokens ?? diagnostics.estimatedInputTokens;
   const cacheHit = diagnostics.cacheHitTokens ?? 0;
   const cacheMiss = diagnostics.cacheMissTokens ?? 0;
+  const completion = diagnostics.completionTokens ?? 0;
+  const total = diagnostics.totalTokens ?? prompt + completion;
   return (
     <details className="context-diagnostics">
       <summary>
-        <span>Context {formatNumber(prompt)} / {formatNumber(diagnostics.inputBudgetTokens)}</span>
-        {diagnostics.promptTokens !== undefined && (
-          <span>Prompt {formatNumber(diagnostics.promptTokens)}</span>
+        <span>Thread {formatNumber(threadTokenUsage.totalTokens)} total</span>
+        <span>Prompt {formatNumber(prompt)}</span>
+        <span>Output {formatNumber(completion)}</span>
+        <span>Request {formatNumber(total)}</span>
+        {diagnostics.contextBudgetTier && <span>{diagnostics.contextBudgetTier} tier</span>}
+        <span>
+          Context {formatNumber(diagnostics.adjustedInputTokens ?? diagnostics.estimatedInputTokens)} /{" "}
+          {formatNumber(diagnostics.inputBudgetTokens)}
+        </span>
+        {diagnostics.compactionCount !== undefined && diagnostics.compactionCount > 0 && (
+          <span>Compacted {formatNumber(diagnostics.compactionCount)}x</span>
+        )}
+        {diagnostics.tokenSafetyFactor !== undefined && diagnostics.tokenSafetyFactor < 1 && (
+          <span>{Math.round(diagnostics.tokenSafetyFactor * 100)}% safety</span>
+        )}
+        {diagnostics.promptInflationFactor !== undefined && diagnostics.promptInflationFactor > 1 && (
+          <span>{diagnostics.promptInflationFactor.toFixed(2)}x inflation</span>
         )}
         {(cacheHit > 0 || cacheMiss > 0) && (
           <span>Cache {formatNumber(cacheHit)} hit / {formatNumber(cacheMiss)} miss</span>
@@ -426,6 +540,36 @@ function ContextDiagnosticsBar({ diagnostics }: { diagnostics: ContextDiagnostic
             <span>{formatNumber(diagnostics.completionTokens)}</span>
           </div>
         )}
+        {diagnostics.estimatedToolTokens !== undefined && diagnostics.estimatedToolTokens > 0 && (
+          <div className="context-slot-row">
+            <span>tool schema est.</span>
+            <span>{formatNumber(diagnostics.estimatedToolTokens)}</span>
+          </div>
+        )}
+        {diagnostics.promptCeilingTokens !== undefined && (
+          <div className="context-slot-row">
+            <span>compact at</span>
+            <span>{formatNumber(diagnostics.promptCeilingTokens)}</span>
+          </div>
+        )}
+        {diagnostics.hardPromptCeilingTokens !== undefined && (
+          <div className="context-slot-row">
+            <span>hard ceiling</span>
+            <span>{formatNumber(diagnostics.hardPromptCeilingTokens)}</span>
+          </div>
+        )}
+        {diagnostics.modelTurnsSinceCompaction !== undefined && (
+          <div className="context-slot-row">
+            <span>model turns since compact</span>
+            <span>{formatNumber(diagnostics.modelTurnsSinceCompaction)}</span>
+          </div>
+        )}
+        {diagnostics.toolCallsSinceCompaction !== undefined && (
+          <div className="context-slot-row">
+            <span>tool calls since compact</span>
+            <span>{formatNumber(diagnostics.toolCallsSinceCompaction)}</span>
+          </div>
+        )}
       </div>
     </details>
   );
@@ -435,6 +579,26 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(Math.round(value));
 }
 
-function isDeepSeekSelection(providerId: string, model: string): boolean {
-  return `${providerId} ${model}`.toLocaleLowerCase().includes("deepseek");
+function modelModesForSelection(
+  providerId: string,
+  model: string,
+): Array<{ id: string; label: string }> {
+  if (`${providerId} ${model}`.toLocaleLowerCase().includes("deepseek")) {
+    return DEEPSEEK_MODES;
+  }
+  if (supportsKimiThinking(providerId, model)) {
+    return KIMI_MODES;
+  }
+  return [];
+}
+
+function defaultModelModeForSelection(providerId: string, model: string): string | undefined {
+  if (`${providerId} ${model}`.toLocaleLowerCase().includes("deepseek")) return "deepseek-high";
+  if (supportsKimiThinking(providerId, model)) return "kimi-on";
+  return undefined;
+}
+
+function supportsKimiThinking(providerId: string, model: string): boolean {
+  const value = `${providerId} ${model}`.toLocaleLowerCase();
+  return value.includes("kimi") && /^kimi-k2\./.test(model);
 }

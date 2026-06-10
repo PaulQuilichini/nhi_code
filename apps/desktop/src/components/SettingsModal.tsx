@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import type { ApprovalRule } from "@nhicode/shared";
 import { CATEGORY_LABEL } from "@nhicode/shared/types";
-import { deleteApprovalRule, fetchApprovalRules, setApiKey, type Config } from "../api";
+import {
+  deleteApprovalRule,
+  fetchApprovalRules,
+  setApiKey,
+  updateAgentConfig,
+  type Config,
+} from "../api";
 
 interface SettingsModalProps {
   config: Config | null;
@@ -9,6 +15,7 @@ interface SettingsModalProps {
   activeProjectId?: string;
   onClose: () => void;
   onProvidersChange: (providers: string[]) => void;
+  onConfigChange: (config: Config) => void;
 }
 
 export function SettingsModal({
@@ -17,15 +24,22 @@ export function SettingsModal({
   activeProjectId,
   onClose,
   onProvidersChange,
+  onConfigChange,
 }: SettingsModalProps) {
   const [keys, setKeys] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState<string | null>(null);
   const [approvalRules, setApprovalRules] = useState<ApprovalRule[]>([]);
   const [deletingRuleId, setDeletingRuleId] = useState<string | null>(null);
+  const [maxTurns, setMaxTurns] = useState("0");
+  const [savingAgentConfig, setSavingAgentConfig] = useState(false);
 
   useEffect(() => {
     void fetchApprovalRules(activeProjectId).then(setApprovalRules).catch(() => setApprovalRules([]));
   }, [activeProjectId]);
+
+  useEffect(() => {
+    setMaxTurns(String(config?.agents?.max_turns ?? 0));
+  }, [config?.agents?.max_turns]);
 
   const handleSaveKey = async (providerId: string) => {
     const key = keys[providerId];
@@ -46,6 +60,18 @@ export function SettingsModal({
       setApprovalRules((prev) => prev.filter((rule) => rule.id !== id));
     } finally {
       setDeletingRuleId(null);
+    }
+  };
+
+  const handleSaveAgentConfig = async () => {
+    const parsed = Number(maxTurns);
+    if (!Number.isFinite(parsed) || parsed < 0) return;
+    setSavingAgentConfig(true);
+    try {
+      const updated = await updateAgentConfig({ max_turns: Math.floor(parsed) });
+      onConfigChange(updated);
+    } finally {
+      setSavingAgentConfig(false);
     }
   };
 
@@ -79,6 +105,31 @@ export function SettingsModal({
               </button>
             </div>
           ))}
+        </div>
+
+        <div className="modal-section">
+          <label>Agent turn cap</label>
+          <div className="settings-inline-row">
+            <input
+              type="number"
+              min="0"
+              step="1"
+              value={maxTurns}
+              onChange={(e) => setMaxTurns(e.target.value)}
+              aria-label="Agent turn cap"
+            />
+            <button
+              className="btn btn-secondary"
+              onClick={() => void handleSaveAgentConfig()}
+              disabled={savingAgentConfig}
+            >
+              {savingAgentConfig ? "…" : "Save"}
+            </button>
+          </div>
+          <div className="settings-help">
+            0 means no total model/tool turn cap. Model request, idle, shell, approval, and cancel
+            limits still apply.
+          </div>
         </div>
 
         <div className="modal-section">

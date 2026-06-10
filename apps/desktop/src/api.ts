@@ -1,8 +1,11 @@
 import type {
+  AgentCarefulness,
   ApprovalResponse,
   ApprovalRule,
+  ContextBudgetTier,
   ObservationRecord,
   Project,
+  QueuedPrompt,
   SessionEvent,
   ThreadSummary,
   TurnResult,
@@ -151,6 +154,15 @@ export async function fetchThreadObservations(threadId: string): Promise<Observa
   return res.json();
 }
 
+export async function fetchQueuedPrompts(threadId: string): Promise<QueuedPrompt[]> {
+  const res = await fetch(`${API}/threads/${threadId}/queue`);
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to load queued prompts");
+  }
+  return res.json();
+}
+
 export async function createThread(opts: {
   projectId?: string;
   cwd?: string;
@@ -158,6 +170,8 @@ export async function createThread(opts: {
   model?: string;
   providerId?: string;
   modelMode?: string;
+  contextBudgetTier?: ContextBudgetTier;
+  agentCarefulness?: AgentCarefulness;
 }): Promise<{
   id: string;
   cwd: string;
@@ -165,6 +179,8 @@ export async function createThread(opts: {
   mode: string;
   model: string;
   modelMode?: string;
+  contextBudgetTier?: ContextBudgetTier;
+  agentCarefulness?: AgentCarefulness;
   providerId?: string;
   status: string;
 }> {
@@ -212,6 +228,17 @@ export async function setThreadModelMode(threadId: string, modelMode?: string): 
   });
 }
 
+export async function setThreadContextBudgetTier(
+  threadId: string,
+  contextBudgetTier: ContextBudgetTier,
+): Promise<void> {
+  await fetch(`${API}/threads/${threadId}/context-tier`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contextBudgetTier }),
+  });
+}
+
 export async function cancelThread(threadId: string): Promise<void> {
   await fetch(`${API}/threads/${threadId}/cancel`, { method: "POST" });
 }
@@ -235,6 +262,54 @@ export async function setApiKey(providerId: string, apiKey: string): Promise<str
   });
   const data = await res.json();
   return data.providers;
+}
+
+export async function updateAgentConfig(patch: { max_turns?: number }): Promise<Config> {
+  const res = await fetch(`${API}/config/agents`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to update agent settings");
+  }
+  return res.json();
+}
+
+export async function queuePrompt(threadId: string, text: string): Promise<QueuedPrompt> {
+  const res = await fetch(`${API}/threads/${threadId}/queue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to queue prompt");
+  }
+  return res.json();
+}
+
+export async function deleteQueuedPrompt(threadId: string, promptId: string): Promise<void> {
+  const res = await fetch(`${API}/threads/${threadId}/queue/${promptId}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to delete queued prompt");
+  }
+}
+
+export async function steerThread(threadId: string, text: string): Promise<void> {
+  const res = await fetch(`${API}/threads/${threadId}/steer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error ?? "Failed to steer thread");
+  }
 }
 
 export function connectWebSocket(
@@ -265,13 +340,27 @@ export function connectWebSocket(
 }
 
 export interface Config {
-  default?: { model?: string; mode?: string; provider?: string };
+  default?: {
+    model?: string;
+    mode?: string;
+    provider?: string;
+    context_budget_tier?: ContextBudgetTier;
+  };
   providers: Array<{
     id: string;
     base_url: string;
     default_model: string;
     api_key_env?: string;
   }>;
+  agents?: {
+    max_turns?: number;
+    max_threads?: number;
+    max_depth?: number;
+    job_max_runtime_seconds?: number;
+    model_idle_timeout_seconds?: number;
+    model_request_timeout_seconds?: number;
+    shell_timeout_seconds?: number;
+  };
 }
 
 export async function fetchConfig(): Promise<Config> {

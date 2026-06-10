@@ -15,6 +15,7 @@ const DEFAULT_CONFIG: NhiCodeConfig = {
     model: "deepseek-v4-pro",
     mode: "agent",
     provider: "deepseek",
+    context_budget_tier: "compact",
   },
   providers: [
     {
@@ -62,6 +63,7 @@ const DEFAULT_CONFIG: NhiCodeConfig = {
   },
   agents: {
     max_threads: 6,
+    max_turns: 0,
     max_depth: 1,
     job_max_runtime_seconds: 0,
     model_idle_timeout_seconds: 300,
@@ -70,11 +72,11 @@ const DEFAULT_CONFIG: NhiCodeConfig = {
     context_input_tokens: 128_000,
     context_output_reserve_tokens: 64_000,
     context_tool_reserve_tokens: 16_000,
-    context_recent_tokens: 16_000,
+    context_recent_tokens: 64_000,
     context_working_memory_tokens: 6_000,
     context_observation_tokens: 24_000,
     context_dynamic_tokens: 2_000,
-    context_file_evidence_tokens: 48_000,
+    context_budget_tier: "compact",
   },
   windows: {
     sandbox: "unelevated",
@@ -126,8 +128,16 @@ export async function loadConfig(cwd?: string): Promise<NhiCodeConfig> {
 
 export async function saveUserConfig(config: Partial<NhiCodeConfig>): Promise<string> {
   const path = join(homedir(), ".nhicode", "nhicode.toml");
+  let existing: Record<string, unknown> = {};
+  try {
+    await access(path);
+    existing = parseToml(await readFile(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    existing = {};
+  }
+  const merged = deepMerge(existing, denormalizeTomlKeys(config));
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, stringifyToml(denormalizeTomlKeys(config)), "utf-8");
+  await writeFile(path, stringifyToml(merged), "utf-8");
   return path;
 }
 

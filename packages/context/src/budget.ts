@@ -2,20 +2,25 @@ import type {
   ContextDiagnostics,
   ContextSlotDiagnostics,
   ContextSlotName,
+  ContextBudgetTier,
   Message,
   ObservationRecord,
 } from "@nhicode/shared";
-import { sanitizeMessageHistory } from "./history.js";
+import { compactOlderReasoning, sanitizeMessageHistory } from "./history.js";
 
 const TOKEN_OVERHEAD_PER_MESSAGE = 8;
 const TOKEN_OVERHEAD_PER_TOOL_CALL = 12;
 const TOKEN_OVERHEAD_PER_SECTION = 16;
 const MIN_INPUT_BUDGET = 8_000;
 const DEFAULT_INPUT_BUDGET = 128_000;
+const DEFAULT_CONTEXT_TIER: ContextBudgetTier = "compact";
 
 export interface ContextBudget {
   maxContextTokens: number;
   maxOutputTokens: number;
+  tier?: ContextBudgetTier;
+  providerId?: string;
+  model?: string;
   inputTokens?: number;
   outputReserveTokens?: number;
   toolReserveTokens?: number;
@@ -23,13 +28,13 @@ export interface ContextBudget {
   workingMemoryTokens?: number;
   observationTokens?: number;
   dynamicTokens?: number;
-  fileEvidenceTokens?: number;
+  safetyFactor?: number;
 }
 
 export interface BuildBudgetedMessagesOptions {
   systemPrompt: string;
   history: Message[];
-  userMessage: string;
+  userMessage?: string | null;
   workingMemory?: string | null;
   dynamicContext?: string | null;
   observations?: ObservationRecord[];
@@ -64,7 +69,7 @@ export function buildBudgetedContext(options: BuildBudgetedMessagesOptions): Bui
     slots,
   );
 
-  const historyBlocks = blockMessageHistory(options.history);
+  const historyBlocks = blockMessageHistory(compactOlderReasoning(options.history));
   const selectedHistory = selectRecentBlocks(
     historyBlocks,
     Math.max(0, budget.recentTokens),
@@ -98,8 +103,18 @@ export function buildBudgetedContext(options: BuildBudgetedMessagesOptions): Bui
     slots,
   );
 
-  const userRequest = [{ role: "user" as const, content: options.userMessage }];
-  slots.push(slot("user_request", estimateMessagesTokens(userRequest), undefined, 1));
+  const userRequest =
+    typeof options.userMessage === "string" && options.userMessage.trim()
+      ? [{ role: "user" as const, content: options.userMessage }]
+      : [];
+  slots.push(
+    slot(
+      "user_request",
+      userRequest.length ? estimateMessagesTokens(userRequest) : 0,
+      undefined,
+      userRequest.length,
+    ),
+  );
 
   const messages = [
     ...stablePrefix,
@@ -115,12 +130,14 @@ export function buildBudgetedContext(options: BuildBudgetedMessagesOptions): Bui
     threadId: options.threadId,
     model: options.model,
     providerId: options.providerId,
+    contextBudgetTier: budget.tier,
     createdAt: new Date().toISOString(),
     estimatedInputTokens,
     inputBudgetTokens: budget.inputTokens,
     maxContextTokens: budget.maxContextTokens,
     outputReserveTokens: budget.outputReserveTokens,
     toolReserveTokens: budget.toolReserveTokens,
+    tokenSafetyFactor: budget.safetyFactor,
     suppressedObservationTokens: observationSlot.suppressedTokens,
     slots,
   };
@@ -131,39 +148,44 @@ export function buildBudgetedContext(options: BuildBudgetedMessagesOptions): Bui
 export function resolveInputBudget(budget?: ContextBudget): Required<ContextBudget> {
   const maxContextTokens = positiveInt(budget?.maxContextTokens) ?? 128_000;
   const maxOutputTokens = positiveInt(budget?.maxOutputTokens) ?? 16_000;
+  const tier = budget?.tier ?? DEFAULT_CONTEXT_TIER;
+  const safetyFactor = Math.min(
+    1,
+    Math.max(0.25, budget?.safetyFactor ?? providerSafetyFactor(budget?.providerId, budget?.model)),
+  );
   const outputReserveTokens =
-    positiveInt(budget?.outputReserveTokens) ?? Math.min(maxOutputTokens, 32_000);
+    Math.min(positiveInt(budget?.outputReserveTokens) ?? Math.min(maxOutputTokens, 32_000), maxOutputTokens);
   const toolReserveTokens = positiveInt(budget?.toolReserveTokens) ?? 16_000;
   const hardInputCeiling = Math.max(
     MIN_INPUT_BUDGET,
-    maxContextTokens - outputReserveTokens - toolReserveTokens,
+    Math.floor((maxContextTokens - outputReserveTokens - toolReserveTokens) * safetyFactor),
   );
   const configuredInput = positiveInt(budget?.inputTokens);
-  const inputTokens = Math.min(configuredInput ?? DEFAULT_INPUT_BUDGET, hardInputCeiling);
+  const inputTokens = Math.min(configuredInput ?? defaultTierInput(tier, hardInputCeiling), hardInputCeiling);
+  const tierDefaults = defaultSlotBudget(tier, inputTokens);
   const recentTokens = Math.min(
-    positiveInt(budget?.recentTokens) ?? Math.min(16_000, inputTokens),
+    positiveInt(budget?.recentTokens) ?? tierDefaults.recentTokens,
     inputTokens,
   );
   const workingMemoryTokens = Math.min(
-    positiveInt(budget?.workingMemoryTokens) ?? 6_000,
+    positiveInt(budget?.workingMemoryTokens) ?? tierDefaults.workingMemoryTokens,
     inputTokens,
   );
   const observationTokens = Math.min(
-    positiveInt(budget?.observationTokens) ?? 24_000,
+    positiveInt(budget?.observationTokens) ?? tierDefaults.observationTokens,
     inputTokens,
   );
   const dynamicTokens = Math.min(
-    positiveInt(budget?.dynamicTokens) ?? 2_000,
-    inputTokens,
-  );
-  const fileEvidenceTokens = Math.min(
-    positiveInt(budget?.fileEvidenceTokens) ?? 48_000,
+    positiveInt(budget?.dynamicTokens) ?? tierDefaults.dynamicTokens,
     inputTokens,
   );
 
   return {
     maxContextTokens,
     maxOutputTokens,
+    tier,
+    providerId: budget?.providerId ?? "",
+    model: budget?.model ?? "",
     inputTokens,
     outputReserveTokens,
     toolReserveTokens,
@@ -171,7 +193,7 @@ export function resolveInputBudget(budget?: ContextBudget): Required<ContextBudg
     workingMemoryTokens,
     observationTokens,
     dynamicTokens,
-    fileEvidenceTokens,
+    safetyFactor,
   };
 }
 
@@ -235,11 +257,16 @@ function observationMessages(
 
   for (const obs of recent) {
     rawTokens += obs.rawTokenEstimate;
-    const item = [
+    const lines = [
       `### ${obs.id} · ${obs.toolName}${obs.isError ? " · error" : ""}`,
       obs.compactContent.trim() || obs.summary,
-      `Raw observation tokens: ~${obs.rawTokenEstimate}. Use expand_observation if exact output is needed.`,
-    ].join("\n");
+    ];
+    if (observationOffersExpansion(obs)) {
+      lines.push(
+        `Raw observation tokens: ~${obs.rawTokenEstimate}. Use expand_observation if exact output is needed.`,
+      );
+    }
+    const item = lines.join("\n");
     const tokens = Math.ceil(item.length / 4) + TOKEN_OVERHEAD_PER_SECTION;
     if (used + tokens > budgetTokens) continue;
     selected.push(item);
@@ -260,6 +287,11 @@ function observationMessages(
     ),
   );
   return { messages, suppressedTokens: Math.max(0, rawTokens - sentTokens) };
+}
+
+/** Only advertise expand_observation when the raw output is meaningfully larger than the compact form. */
+export function observationOffersExpansion(observation: ObservationRecord): boolean {
+  return observation.rawTokenEstimate >= Math.max(1, observation.tokenEstimate) * 1.5;
 }
 
 function truncateToTokens(value: string, maxTokens: number): { text: string; truncated: boolean } {
@@ -343,4 +375,61 @@ function selectRecentBlocks(
 function positiveInt(value: number | undefined): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
   return Math.floor(value);
+}
+
+function defaultTierInput(
+  tier: ContextBudgetTier,
+  hardInputCeiling: number,
+): number {
+  if (tier === "full") {
+    return hardInputCeiling;
+  }
+
+  if (tier === "long") {
+    return Math.min(
+      hardInputCeiling,
+      hardInputCeiling >= 500_000 ? 512_000 : Math.floor(hardInputCeiling * 0.95),
+    );
+  }
+
+  return Math.min(DEFAULT_INPUT_BUDGET, hardInputCeiling);
+}
+
+function defaultSlotBudget(
+  tier: ContextBudgetTier,
+  inputTokens: number,
+): Required<Pick<
+  ContextBudget,
+  "recentTokens" | "workingMemoryTokens" | "observationTokens" | "dynamicTokens"
+>> {
+  if (tier === "full") {
+    return {
+      recentTokens: Math.floor(inputTokens * 0.62),
+      workingMemoryTokens: Math.min(24_000, Math.floor(inputTokens * 0.04)),
+      observationTokens: Math.floor(inputTokens * 0.15),
+      dynamicTokens: Math.min(8_000, Math.floor(inputTokens * 0.02)),
+    };
+  }
+
+  if (tier === "long") {
+    return {
+      recentTokens: Math.floor(inputTokens * 0.6),
+      workingMemoryTokens: Math.min(12_000, Math.floor(inputTokens * 0.06)),
+      observationTokens: Math.floor(inputTokens * 0.15),
+      dynamicTokens: Math.min(4_000, Math.floor(inputTokens * 0.03)),
+    };
+  }
+
+  return {
+    recentTokens: Math.min(64_000, inputTokens),
+    workingMemoryTokens: Math.min(6_000, inputTokens),
+    observationTokens: Math.min(24_000, inputTokens),
+    dynamicTokens: Math.min(2_000, inputTokens),
+  };
+}
+
+function providerSafetyFactor(providerId?: string, model?: string): number {
+  const key = `${providerId ?? ""} ${model ?? ""}`.toLowerCase();
+  if (key.includes("kimi")) return 0.8;
+  return 1;
 }

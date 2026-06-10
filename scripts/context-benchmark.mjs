@@ -42,11 +42,10 @@ const result = buildBudgetedContext({
     inputTokens: 128_000,
     outputReserveTokens: 64_000,
     toolReserveTokens: 16_000,
-    recentTokens: 16_000,
+    recentTokens: 64_000,
     workingMemoryTokens: 6_000,
     observationTokens: 24_000,
     dynamicTokens: 2_000,
-    fileEvidenceTokens: 48_000,
   },
 });
 

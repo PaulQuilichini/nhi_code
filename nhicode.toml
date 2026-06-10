@@ -2,6 +2,7 @@
 model = "deepseek-v4-pro"
 mode = "agent"
 provider = "deepseek"
+context_budget_tier = "compact"
 
 [[providers]]
 id = "deepseek"
@@ -39,6 +40,7 @@ default_approval = "on-request"
 
 [agents]
 max_threads = 6
+max_turns = 0
 max_depth = 1
 job_max_runtime_seconds = 0
 model_idle_timeout_seconds = 300
@@ -47,11 +49,11 @@ shell_timeout_seconds = 1800
 context_input_tokens = 128000
 context_output_reserve_tokens = 64000
 context_tool_reserve_tokens = 16000
-context_recent_tokens = 16000
+context_recent_tokens = 64000
 context_working_memory_tokens = 6000
 context_observation_tokens = 24000
 context_dynamic_tokens = 2000
-context_file_evidence_tokens = 48000
+context_budget_tier = "compact"
 
 [windows]
 sandbox = "unelevated"

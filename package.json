@@ -10,6 +10,7 @@
     "build": "pnpm build:packages && pnpm --filter @nhicode/desktop build",
     "typecheck": "pnpm -r typecheck",
     "benchmark:context": "node scripts/context-benchmark.mjs",
+    "test:carefulness": "node scripts/carefulness-self-test.mjs",
     "start": "pnpm --filter @nhicode/desktop start"
   },
   "engines": {

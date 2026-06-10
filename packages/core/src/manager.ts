@@ -12,13 +12,16 @@ import {
   buildThreadMemory,
   sanitizeMessageHistory,
 } from "@nhicode/context";
-import { loadConfig, resolveApiKey } from "@nhicode/shared";
+import { loadConfig, resolveApiKey, saveUserConfig } from "@nhicode/shared";
 import type {
+  AgentCarefulness,
   ApprovalRule,
   ApprovalResponse,
+  ContextBudgetTier,
   ObservationRecord,
   Message,
   Project,
+  QueuedPrompt,
   SessionConfig,
   SessionEvent,
   SubAgentConfig,
@@ -30,7 +33,7 @@ import { Session } from "./session.js";
 import type { AgentEngineOptions, PersistApprovalInput } from "./session.js";
 import { JsonStore } from "./store.js";
 import { ApiKeyStore } from "./keys.js";
-import type { StoredMessage, StoredRunEvent } from "./store.js";
+import type { StoredMessage, StoredQueuedPrompt, StoredRunEvent } from "./store.js";
 
 export interface SessionManagerOptions {
   dataDir?: string;
@@ -165,6 +168,8 @@ export class SessionManager {
     model?: string;
     providerId?: string;
     modelMode?: string;
+    contextBudgetTier?: ContextBudgetTier;
+    agentCarefulness?: AgentCarefulness;
     parentId?: string;
     agentProfile?: string;
   }): Session {
@@ -203,6 +208,12 @@ export class SessionManager {
       this.config.providers.find((p) => p.id === providerId)?.default_model ??
       "deepseek-v4-pro";
     const modelMode = options.modelMode ?? defaultModelMode(providerId, model);
+    const contextBudgetTier =
+      options.contextBudgetTier ??
+      this.config.default?.context_budget_tier ??
+      this.config.agents?.context_budget_tier ??
+      "compact";
+    const agentCarefulness = options.agentCarefulness ?? defaultAgentCarefulness();
     const approvalProjectPath = projectId
       ? this.store.getProject(projectId)?.path ?? cwd
       : cwd;
@@ -213,6 +224,8 @@ export class SessionManager {
       mode,
       model,
       modelMode,
+      contextBudgetTier,
+      agentCarefulness,
       providerId,
       parentId: options.parentId,
       agentProfile: options.agentProfile,
@@ -222,11 +235,11 @@ export class SessionManager {
     policy.setApprovalRules(this.store.listApprovalRules(approvalProjectPath));
     const context = new ContextBuilder();
 
-    let maxTurns = 30;
+    let maxTurns = this.config.agents?.max_turns ?? 0;
     if (options.agentProfile) {
       const profile = AGENT_PROFILES[options.agentProfile];
       if (profile) {
-        maxTurns = profile.maxTurns;
+        maxTurns = profile.maxTurns ?? maxTurns;
         policy.setMode(profile.mode);
       }
     }
@@ -244,7 +257,7 @@ export class SessionManager {
       policy,
       this.tools,
       context,
-      this.buildSessionOptions(providerId, model, maxTurns, maxDepth, approvalProjectPath),
+      this.buildSessionOptions(providerId, model, contextBudgetTier, maxTurns, maxDepth, approvalProjectPath),
       options.parentId ? 1 : 0,
     );
 
@@ -260,6 +273,8 @@ export class SessionManager {
       mode,
       model,
       modelMode,
+      contextBudgetTier,
+      agentCarefulness,
       providerId,
       status: "idle",
       parentId: options.parentId,
@@ -290,6 +305,8 @@ export class SessionManager {
       mode: profile?.mode ?? "agent",
       model: subConfig.model ?? (subConfig.inheritModel !== false ? model : undefined),
       modelMode: parent.getModelMode(),
+      contextBudgetTier: parent.getContextBudgetTier(),
+      agentCarefulness: parent.getAgentCarefulness(),
       providerId,
       parentId,
       agentProfile: subConfig.profile,
@@ -317,7 +334,7 @@ export class SessionManager {
       : thread.cwd;
     policy.setApprovalRules(this.store.listApprovalRules(approvalProjectPath));
     const context = new ContextBuilder();
-    const maxTurns = 30;
+    const maxTurns = this.config.agents?.max_turns ?? 0;
     const maxDepth = this.config.agents?.max_depth ?? 1;
 
     const config: SessionConfig = {
@@ -326,6 +343,8 @@ export class SessionManager {
       mode: thread.mode,
       model: thread.model,
       modelMode: thread.modelMode ?? defaultModelMode(providerId, thread.model),
+      contextBudgetTier: thread.contextBudgetTier ?? "compact",
+      agentCarefulness: thread.agentCarefulness ?? defaultAgentCarefulness(),
       providerId,
       parentId: thread.parentId,
     };
@@ -336,7 +355,7 @@ export class SessionManager {
       policy,
       this.tools,
       context,
-      this.buildSessionOptions(providerId, thread.model, maxTurns, maxDepth, approvalProjectPath),
+      this.buildSessionOptions(providerId, thread.model, config.contextBudgetTier ?? "compact", maxTurns, maxDepth, approvalProjectPath),
       thread.parentId ? 1 : 0,
     );
 
@@ -366,12 +385,60 @@ export class SessionManager {
     });
   }
 
+  setThreadContextBudgetTier(threadId: string, contextBudgetTier: ContextBudgetTier): void {
+    this.sessions.get(threadId)?.setContextBudgetTier(contextBudgetTier);
+    this.store.updateThread(threadId, {
+      contextBudgetTier,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  async updateAgentConfig(patch: { max_turns?: number }): Promise<NhiCodeConfig> {
+    const agents = {
+      ...(this.config.agents ?? {}),
+      ...(patch.max_turns !== undefined
+        ? { max_turns: Math.max(0, Math.floor(patch.max_turns)) }
+        : {}),
+    };
+    this.config = { ...this.config, agents };
+    if (patch.max_turns !== undefined) {
+      for (const session of this.sessions.values()) {
+        session.setMaxTurns(agents.max_turns ?? 0);
+      }
+    }
+    await saveUserConfig({ agents });
+    return this.config;
+  }
+
   getThreadEvents(threadId: string): StoredRunEvent[] {
     return this.store.listRunEvents(threadId);
   }
 
-  listObservations(threadId: string, limit?: number): ObservationRecord[] {
-    return this.store.listObservations(threadId, limit);
+  listQueuedPrompts(threadId: string): QueuedPrompt[] {
+    return this.store.listQueuedPrompts(threadId);
+  }
+
+  enqueuePrompt(threadId: string, text: string): QueuedPrompt {
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Prompt text is required");
+    return this.store.addQueuedPrompt(threadId, trimmed);
+  }
+
+  deleteQueuedPrompt(threadId: string, promptId: string): void {
+    const prompt = this.store.listQueuedPrompts(threadId).find((item) => item.id === promptId);
+    if (!prompt || !this.store.deleteQueuedPrompt(promptId)) {
+      throw new Error(`Queued prompt '${promptId}' not found`);
+    }
+  }
+
+  steerThread(threadId: string, text: string): void {
+    const session = this.ensureSession(threadId);
+    if (!session) throw new Error("Thread not found");
+    session.addSteering(text);
+  }
+
+  listObservations(threadId: string, limit?: number, afterCreatedAt?: string): ObservationRecord[] {
+    return this.store.listObservations(threadId, limit, afterCreatedAt);
   }
 
   getObservation(threadId: string, id: string): ObservationRecord | undefined {
@@ -381,10 +448,12 @@ export class SessionManager {
   private buildSessionOptions(
     providerId: string,
     model: string,
+    contextBudgetTier: ContextBudgetTier,
     maxTurns: number,
     maxDepth: number,
     approvalProjectPath: string,
   ): AgentEngineOptions {
+    const compactTier = contextBudgetTier === "compact";
     return {
       maxTurns,
       maxDepth,
@@ -393,18 +462,20 @@ export class SessionManager {
       modelRequestTimeoutMs: secondsToMs(
         this.config.agents?.model_request_timeout_seconds ?? 1800,
       ),
-      contextInputTokens: this.config.agents?.context_input_tokens,
+      contextBudgetTier,
+      contextInputTokens: compactTier ? this.config.agents?.context_input_tokens : undefined,
       contextOutputReserveTokens: this.config.agents?.context_output_reserve_tokens ?? 64_000,
       contextToolReserveTokens: this.config.agents?.context_tool_reserve_tokens ?? 16_000,
-      contextRecentTokens: this.config.agents?.context_recent_tokens ?? 16_000,
-      contextWorkingMemoryTokens: this.config.agents?.context_working_memory_tokens ?? 6_000,
-      contextObservationTokens: this.config.agents?.context_observation_tokens ?? 24_000,
-      contextDynamicTokens: this.config.agents?.context_dynamic_tokens ?? 2_000,
-      contextFileEvidenceTokens: this.config.agents?.context_file_evidence_tokens ?? 48_000,
+      contextRecentTokens: compactTier ? this.config.agents?.context_recent_tokens ?? 64_000 : undefined,
+      contextWorkingMemoryTokens: compactTier ? this.config.agents?.context_working_memory_tokens ?? 6_000 : undefined,
+      contextObservationTokens: compactTier ? this.config.agents?.context_observation_tokens ?? 24_000 : undefined,
+      contextDynamicTokens: compactTier ? this.config.agents?.context_dynamic_tokens ?? 2_000 : undefined,
       persistApproval: (input) => this.persistApproval(approvalProjectPath, input),
       recordObservation: (input) => this.store.addObservation(input),
-      listObservations: (threadId, limit) => this.store.listObservations(threadId, limit),
+      listObservations: (threadId, limit, afterCreatedAt) =>
+        this.store.listObservations(threadId, limit, afterCreatedAt),
       getObservation: (threadId, id) => this.store.getObservation(threadId, id),
+      listRunEvents: (threadId, limit) => this.store.listRunEvents(threadId, limit),
       onSpawnSubAgent: (parentId, subConfig) =>
         Promise.resolve(this.createSubAgent(parentId, subConfig, providerId, model)),
     };
@@ -462,6 +533,11 @@ export class SessionManager {
         );
         this.store.setThreadMemory(threadId, memory);
         session.restoreMemory(memory);
+        if (event.result.status === "completed") {
+          queueMicrotask(() => {
+            void this.startNextQueuedPrompt(threadId);
+          });
+        }
       }
     }
   }
@@ -480,6 +556,23 @@ export class SessionManager {
     }
     if (!session) return () => {};
     return session.on(listener);
+  }
+
+  private async startNextQueuedPrompt(threadId: string): Promise<void> {
+    const session = this.ensureSession(threadId);
+    if (!session) return;
+    if (session.getStatus() === "running" || session.getStatus() === "waiting_approval") return;
+    const next = this.store.takeQueuedPrompt(threadId);
+    if (!next) return;
+    try {
+      await session.sendQueuedPrompt(next.id, next.text);
+    } catch {
+      this.restoreQueuedPrompt(next);
+    }
+  }
+
+  private restoreQueuedPrompt(prompt: StoredQueuedPrompt): void {
+    this.store.restoreQueuedPrompt(prompt);
   }
 }
 
@@ -503,6 +596,11 @@ function defaultModelMode(providerId?: string, model?: string): string | undefin
   return value.includes("deepseek") ? "deepseek-high" : undefined;
 }
 
+function defaultAgentCarefulness(): AgentCarefulness {
+  // Review-after-write and verification gating are universally desirable.
+  return "codex";
+}
+
 function turnResultStatus(result: { status: "completed" | "error" | "cancelled" }): ThreadSummary["status"] {
   if (result.status === "completed") return "completed";
   if (result.status === "cancelled") return "cancelled";
@@ -517,6 +615,14 @@ function summarizeSessionEvent(
     case "thinking_delta":
     case "mode_changed":
       return null;
+    case "queued_prompt_started":
+      return {
+        type: event.type,
+        detail: {
+          promptId: event.promptId,
+          textLength: event.text.length,
+        },
+      };
     case "status_changed":
       return { type: event.type, status: event.status };
     case "tool_call":
@@ -547,8 +653,18 @@ function summarizeSessionEvent(
         type: event.type,
         detail: {
           estimatedInputTokens: event.diagnostics.estimatedInputTokens,
+          adjustedInputTokens: event.diagnostics.adjustedInputTokens,
+          estimatedToolTokens: event.diagnostics.estimatedToolTokens,
           inputBudgetTokens: event.diagnostics.inputBudgetTokens,
           maxContextTokens: event.diagnostics.maxContextTokens,
+          contextBudgetTier: event.diagnostics.contextBudgetTier,
+          tokenSafetyFactor: event.diagnostics.tokenSafetyFactor,
+          promptInflationFactor: event.diagnostics.promptInflationFactor,
+          promptCeilingTokens: event.diagnostics.promptCeilingTokens,
+          hardPromptCeilingTokens: event.diagnostics.hardPromptCeilingTokens,
+          compactionCount: event.diagnostics.compactionCount,
+          modelTurnsSinceCompaction: event.diagnostics.modelTurnsSinceCompaction,
+          toolCallsSinceCompaction: event.diagnostics.toolCallsSinceCompaction,
           outputReserveTokens: event.diagnostics.outputReserveTokens,
           toolReserveTokens: event.diagnostics.toolReserveTokens,
           promptTokens: event.diagnostics.promptTokens,
@@ -610,6 +726,9 @@ function summarizeSessionEvent(
           reason: event.result.reason,
           textLength: event.result.text.length,
           toolCallCount: event.result.toolCalls.length,
+          promptTokens: event.result.usage?.promptTokens,
+          completionTokens: event.result.usage?.completionTokens,
+          totalTokens: event.result.usage?.totalTokens,
         },
       };
     case "error":

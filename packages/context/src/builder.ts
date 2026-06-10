@@ -10,7 +10,7 @@ import {
   type BuildBudgetedContextResult,
   type ContextBudget,
 } from "./budget.js";
-import { sanitizeMessageHistory, trimMessageHistory } from "./history.js";
+import { compactOlderReasoning, sanitizeMessageHistory, trimMessageHistory } from "./history.js";
 
 const execFileAsync = promisify(execFile);
 const PROJECT_DOC_MAX_BYTES = 32 * 1024;
@@ -25,10 +25,7 @@ Communication style (match Codex / Claude Code):
 - Use markdown for code blocks and file paths. Keep prose tight.
 - When editing, explain the change in one or two sentences max unless the user wants detail.
 
-Guidelines:
-- Read relevant files before making changes
-- Make minimal, focused edits
-- When stuck, explore the codebase with grep/glob before guessing
+Tool usage:
 - Prefer edit_file for surgical changes, write_file for new files
 - Use shell for commands, not for creating source files with echo/redirection
 - For temporary multi-line code, use the shell tool's script + interpreter fields instead of inline node -e, python -c, heredocs, or echo pipes`;
@@ -81,7 +78,7 @@ export class ContextBuilder {
   buildMessages(
     systemPrompt: string,
     history: Message[],
-    userMessage: string,
+    userMessage?: string | null,
     options: MessageBuildOptions = {},
   ): Message[] {
     if (options.budget) {
@@ -99,20 +96,20 @@ export class ContextBuilder {
       });
     }
 
-    const trimmed = trimMessageHistory(history, options.maxHistoryMessages ?? 40);
+    const trimmed = trimMessageHistory(compactOlderReasoning(history), options.maxHistoryMessages ?? 40);
     return [
       { role: "system", content: systemPrompt },
       ...memoryMessage(options.workingMemory),
       ...trimmed,
       ...dynamicMessage(options.dynamicContext),
-      { role: "user", content: userMessage },
+      ...(userMessage ? [{ role: "user" as const, content: userMessage }] : []),
     ];
   }
 
   buildContext(
     systemPrompt: string,
     history: Message[],
-    userMessage: string,
+    userMessage?: string | null,
     options: MessageBuildOptions = {},
   ): BuildBudgetedContextResult {
     return buildBudgetedContext({
@@ -248,24 +245,21 @@ function dynamicMessage(dynamicContext?: string | null): Message[] {
   return content ? [{ role: "system", content: `## Current Workspace State\n\n${content}` }] : [];
 }
 
-export const AGENT_PROFILES: Record<string, { mode: string; systemPrompt: string; maxTurns: number }> = {
+export const AGENT_PROFILES: Record<string, { mode: string; systemPrompt: string; maxTurns?: number }> = {
   explorer: {
     mode: "ask",
-    maxTurns: 15,
     systemPrompt: `You are an Explorer sub-agent. Your job is to search and map the codebase.
-Return a concise summary of: file structure, key modules, patterns found, and relevant files for the task.
+Return a concise summary of: file structure, key modules, patterns found, relevant files for the task, and any uncertainty.
 Do NOT make any changes.`,
   },
   implementer: {
     mode: "agent",
-    maxTurns: 25,
     systemPrompt: `You are an Implementer sub-agent. Your job is to write code for a specific scoped task.
-Make the minimal changes needed. Return a summary of what you changed and why.`,
+Make the minimal changes needed. Return the exact files changed, what you changed, why, and what verification is still needed.`,
   },
   reviewer: {
     mode: "ask",
-    maxTurns: 10,
-    systemPrompt: `You are a Reviewer sub-agent. Review code changes for bugs, style issues, and missing edge cases.
+    systemPrompt: `You are a Reviewer sub-agent. Review code changes for bugs, regressions, missing tests, and mismatch with the user request.
 Return a structured review with severity levels (critical/warning/info).`,
   },
 };

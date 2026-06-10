@@ -42,6 +42,45 @@ export function sanitizeMessageHistory(messages: Message[]): Message[] {
   return result;
 }
 
+const REASONING_KEEP_RECENT_TURNS = 3;
+const REASONING_SUMMARY_MAX_CHARS = 240;
+
+/**
+ * Replace reasoning_content on older assistant turns with a one-sentence summary.
+ * Only the returned copies are altered; the input messages are left intact so
+ * persisted history keeps full reasoning.
+ */
+export function compactOlderReasoning(
+  messages: Message[],
+  keepRecent = REASONING_KEEP_RECENT_TURNS,
+): Message[] {
+  const reasoningIndexes: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "assistant" && msg.reasoning_content?.trim()) {
+      reasoningIndexes.push(i);
+    }
+  }
+  if (reasoningIndexes.length <= keepRecent) return messages;
+
+  const compactable = new Set(reasoningIndexes.slice(0, reasoningIndexes.length - keepRecent));
+  return messages.map((msg, i) =>
+    compactable.has(i)
+      ? { ...msg, reasoning_content: summarizeReasoning(msg.reasoning_content!) }
+      : msg,
+  );
+}
+
+function summarizeReasoning(reasoning: string): string {
+  const normalized = reasoning.replace(/\s+/g, " ").trim();
+  const firstSentence = normalized.split(/(?<=[.!?])\s/, 1)[0] ?? normalized;
+  const summary =
+    firstSentence.length > REASONING_SUMMARY_MAX_CHARS
+      ? `${firstSentence.slice(0, REASONING_SUMMARY_MAX_CHARS).trimEnd()}…`
+      : firstSentence;
+  return `[earlier reasoning summarized] ${summary}`;
+}
+
 /** Trim history without splitting assistant/tool-call blocks. */
 export function trimMessageHistory(messages: Message[], max: number): Message[] {
   if (messages.length <= max) return sanitizeMessageHistory(messages);

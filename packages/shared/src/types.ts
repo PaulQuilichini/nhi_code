@@ -197,6 +197,8 @@ export interface SessionConfig {
   model: string;
   providerId: string;
   modelMode?: string;
+  contextBudgetTier?: ContextBudgetTier;
+  agentCarefulness?: AgentCarefulness;
   parentId?: string;
   agentProfile?: string;
 }
@@ -225,6 +227,7 @@ export interface TurnResult {
 export type SessionEvent =
   | { type: "text_delta"; content: string }
   | { type: "thinking_delta"; content: string }
+  | { type: "queued_prompt_started"; promptId: string; text: string }
   | { type: "tool_call"; call: ToolCall }
   | { type: "tool_result"; result: ToolResult }
   | { type: "context_diagnostics"; diagnostics: ContextDiagnostics }
@@ -257,6 +260,7 @@ export const NhiCodeConfigSchema = z.object({
       model: z.string().optional(),
       mode: z.string().optional(),
       provider: z.string().optional(),
+      context_budget_tier: z.enum(["compact", "long", "full"]).optional(),
     })
     .optional(),
   providers: z.array(ProviderConfigSchema).default([]),
@@ -269,6 +273,7 @@ export const NhiCodeConfigSchema = z.object({
   agents: z
     .object({
       max_threads: z.number().optional(),
+      max_turns: z.number().optional(),
       max_depth: z.number().optional(),
       job_max_runtime_seconds: z.number().optional(),
       model_idle_timeout_seconds: z.number().optional(),
@@ -281,7 +286,7 @@ export const NhiCodeConfigSchema = z.object({
       context_working_memory_tokens: z.number().optional(),
       context_observation_tokens: z.number().optional(),
       context_dynamic_tokens: z.number().optional(),
-      context_file_evidence_tokens: z.number().optional(),
+      context_budget_tier: z.enum(["compact", "long", "full"]).optional(),
     })
     .optional(),
   windows: z
@@ -315,12 +320,17 @@ export interface ThreadSummary {
   mode: string;
   model: string;
   modelMode?: string;
+  contextBudgetTier?: ContextBudgetTier;
+  agentCarefulness?: AgentCarefulness;
   providerId?: string;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;
   parentId?: string;
 }
+
+export type ContextBudgetTier = "compact" | "long" | "full";
+export type AgentCarefulness = "standard" | "codex";
 
 export interface ApprovalRequest {
   requestId: string;
@@ -370,6 +380,13 @@ export interface ObservationRecord {
   createdAt: string;
 }
 
+export interface QueuedPrompt {
+  id: string;
+  threadId: string;
+  text: string;
+  createdAt: string;
+}
+
 export type ContextSlotName =
   | "stable_prefix"
   | "working_memory"
@@ -390,12 +407,22 @@ export interface ContextDiagnostics {
   threadId?: string;
   model?: string;
   providerId?: string;
+  contextBudgetTier?: ContextBudgetTier;
   createdAt: string;
   estimatedInputTokens: number;
+  adjustedInputTokens?: number;
+  estimatedToolTokens?: number;
   inputBudgetTokens: number;
   maxContextTokens: number;
   outputReserveTokens: number;
   toolReserveTokens: number;
+  tokenSafetyFactor?: number;
+  promptInflationFactor?: number;
+  promptCeilingTokens?: number;
+  hardPromptCeilingTokens?: number;
+  compactionCount?: number;
+  modelTurnsSinceCompaction?: number;
+  toolCallsSinceCompaction?: number;
   suppressedObservationTokens: number;
   cacheHitTokens?: number;
   cacheMissTokens?: number;

@@ -17,7 +17,7 @@ export interface ModelProvider {
   listModels(): Promise<ModelInfo[]>;
   getModelInfo(model?: string): ModelInfo;
   chat(request: ChatRequest): AsyncIterable<ChatEvent>;
-  estimateTokens(messages: Message[]): Promise<number>;
+  estimateTokens(messages: Message[], model?: string): Promise<number>;
   capabilities: ModelCapabilities;
 }
 
@@ -76,12 +76,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private defaultModel: string;
   private generationConfig: Record<string, unknown>;
   private providerLabel: string;
+  private apiKey: string;
+  private baseUrl: string;
 
   constructor(config: ModelProviderConfig, providerLabel?: string) {
     this.id = config.id;
     this.defaultModel = config.defaultModel;
     this.generationConfig = config.generationConfig ?? {};
     this.providerLabel = providerLabel ?? config.id;
+    this.apiKey = config.apiKey;
+    this.baseUrl = config.baseUrl;
     this.client = new OpenAI({
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
@@ -145,11 +149,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
       model,
       generationConfig,
     );
+    const reasoningPolicy = reasoningReplayPolicy(this.providerLabel, model, generationConfig);
     const [system, dialog] = splitSystemMessages(request.messages);
     const openaiMessages = [
-      ...system.map((msg) => toOpenAIMessage(msg, { deepSeekThinking })),
+      ...system.map((msg) => toOpenAIMessage(msg, { deepSeekThinking, reasoningPolicy })),
       ...sanitizeMessageHistory(dialog).map((msg) =>
-        toOpenAIMessage(msg, { deepSeekThinking }),
+        toOpenAIMessage(msg, { deepSeekThinking, reasoningPolicy }),
       ),
     ];
     const idleTimeoutMs =
@@ -286,9 +291,36 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
   }
 
-  async estimateTokens(messages: Message[]): Promise<number> {
-    const text = messages.map((m) => m.content ?? "").join(" ");
-    return Math.ceil(text.length / 4);
+  async estimateTokens(messages: Message[], model = this.defaultModel): Promise<number> {
+    if (isKimiModel(this.providerLabel, model) && this.baseUrl.includes("moonshot")) {
+      const estimated = await this.estimateKimiTokens(messages, model).catch(() => undefined);
+      if (estimated) return estimated;
+    }
+    return estimateMessagesLocally(messages);
+  }
+
+  private async estimateKimiTokens(messages: Message[], model: string): Promise<number | undefined> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
+    try {
+      const response = await fetch(kimiTokenEstimateUrl(this.baseUrl), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: messages.map(toKimiEstimateMessage),
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) return undefined;
+      const data = (await response.json()) as unknown;
+      return readTokenEstimate(data);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -339,6 +371,47 @@ function usageFromChunk(usage: unknown, previous?: TokenUsage): TokenUsage | und
       numberField(value.reasoning_tokens) ??
       previous?.reasoningTokens,
   };
+}
+
+function estimateMessagesLocally(messages: Message[]): number {
+  let chars = 0;
+  for (const message of messages) {
+    chars += message.content?.length ?? 0;
+    chars += message.reasoning_content?.length ?? 0;
+    chars += message.name?.length ?? 0;
+    chars += message.tool_call_id?.length ?? 0;
+    for (const call of message.tool_calls ?? []) {
+      chars += call.id.length + call.function.name.length + call.function.arguments.length;
+    }
+  }
+  return Math.ceil(chars / 4) + messages.length * 8;
+}
+
+function toKimiEstimateMessage(message: Message): { role: "system" | "user" | "assistant"; content: string } {
+  if (message.role === "tool") {
+    return { role: "assistant", content: `Tool result ${message.name ?? ""}:\n${message.content ?? ""}` };
+  }
+  return {
+    role: message.role === "assistant" || message.role === "system" ? message.role : "user",
+    content: message.content ?? "",
+  };
+}
+
+function kimiTokenEstimateUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "");
+  return `${trimmed}/tokenizers/estimate-token-count`;
+}
+
+function readTokenEstimate(data: unknown): number | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const value = data as Record<string, unknown>;
+  return (
+    numberField(value.total_tokens) ??
+    numberField(value.totalTokens) ??
+    numberField(objectField(value.data)?.total_tokens) ??
+    numberField(objectField(value.data)?.totalTokens) ??
+    numberField(objectField(value.usage)?.total_tokens)
+  );
 }
 
 function numberField(value: unknown): number | undefined {
@@ -490,9 +563,12 @@ function splitSystemMessages(messages: Message[]): [Message[], Message[]] {
 
 function toOpenAIMessage(
   msg: Message,
-  opts: { deepSeekThinking?: boolean } = {},
+  opts: {
+    deepSeekThinking?: boolean;
+    reasoningPolicy?: ReasoningReplayPolicy;
+  } = {},
 ): OpenAI.ChatCompletionMessageParam {
-  const reasoning = shouldSendReasoningContent(msg, opts.deepSeekThinking)
+  const reasoning = shouldSendReasoningContent(msg, opts.reasoningPolicy ?? "none")
     ? { reasoning_content: msg.reasoning_content }
     : {};
   switch (msg.role) {
@@ -530,11 +606,30 @@ function toOpenAIMessage(
 
 function shouldSendReasoningContent(
   msg: Message,
-  deepSeekThinking?: boolean,
+  policy: ReasoningReplayPolicy,
 ): msg is Message & { reasoning_content: string } {
   if (!msg.reasoning_content) return false;
-  if (!deepSeekThinking) return true;
-  return msg.role === "assistant" && Boolean(msg.tool_calls?.length);
+  if (policy === "all") return true;
+  if (policy === "tool_calls") {
+    return msg.role === "assistant" && Boolean(msg.tool_calls?.length);
+  }
+  return false;
+}
+
+type ReasoningReplayPolicy = "none" | "tool_calls" | "all";
+
+function reasoningReplayPolicy(
+  providerLabel: string,
+  model: string,
+  generationConfig: Record<string, unknown>,
+): ReasoningReplayPolicy {
+  if (isDeepSeekThinkingMode(providerLabel, model, generationConfig)) {
+    return "tool_calls";
+  }
+  if (isKimiModel(providerLabel, model) && hasThinkingKeepAll(generationConfig)) {
+    return "all";
+  }
+  return "none";
 }
 
 function isDeepSeekThinkingMode(
@@ -556,6 +651,22 @@ function isDeepSeekModel(providerLabel: string, model: string): boolean {
   const provider = providerLabel.toLowerCase();
   const modelId = model.toLowerCase();
   return provider.includes("deepseek") || modelId.startsWith("deepseek-");
+}
+
+function isKimiModel(providerLabel: string, model: string): boolean {
+  const provider = providerLabel.toLowerCase();
+  const modelId = model.toLowerCase();
+  return provider.includes("kimi") || modelId.startsWith("kimi-");
+}
+
+function hasThinkingKeepAll(generationConfig: Record<string, unknown>): boolean {
+  const thinking = generationConfig.thinking;
+  return (
+    Boolean(thinking) &&
+    typeof thinking === "object" &&
+    !Array.isArray(thinking) &&
+    (thinking as Record<string, unknown>).keep === "all"
+  );
 }
 
 function matchesProviderModel(providerLabel: string, modelId: string): boolean {

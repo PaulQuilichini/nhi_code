@@ -292,6 +292,19 @@ export const toolDefinitions: ToolDefinition[] = [
   },
 ];
 
+/** Session-level context tools — handled in-session, safe in every mode. */
+const CONTEXT_TOOL_NAMES = new Set([
+  "expand_observation",
+  "promote_context",
+  "drop_context",
+  "summarize_phase",
+]);
+
+export interface ToolDefinitionFilter {
+  allowedTools?: readonly string[];
+  deniedTools?: readonly string[];
+}
+
 export class ToolRegistry {
   private handlers: Map<string, ToolHandler["execute"]> = new Map();
   private shellTimeoutMs = DEFAULT_SHELL_TIMEOUT_MS;
@@ -314,8 +327,18 @@ export class ToolRegistry {
     this.handlers.set("spawn_subagent", spawnSubagentTool);
   }
 
-  getDefinitions(): ToolDefinition[] {
-    return toolDefinitions;
+  getDefinitions(filter?: ToolDefinitionFilter): ToolDefinition[] {
+    const allowed = filter?.allowedTools ? new Set(filter.allowedTools) : null;
+    const denied = new Set(filter?.deniedTools ?? []);
+    if (!allowed && denied.size === 0) return toolDefinitions;
+
+    return toolDefinitions.filter((def) => {
+      const name = def.function.name;
+      if (CONTEXT_TOOL_NAMES.has(name)) return true;
+      if (denied.has(name)) return false;
+      if (allowed && !allowed.has(name)) return false;
+      return true;
+    });
   }
 
   setShellTimeoutMs(timeoutMs: number): void {
